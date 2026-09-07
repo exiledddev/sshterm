@@ -2278,10 +2278,12 @@ dependencies = [
  "dirs",
  "eframe",
  "portable-pty",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2",
  "vt100",
+ "x11rb",
 ]
 
 [[package]]

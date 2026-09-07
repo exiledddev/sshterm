@@ -429,7 +429,7 @@ fn draw_candidates(
         CornerRadius::same(10),
         Color32::from_black_alpha(90),
     );
-    theme::frost(painter, panel, 10, theme::GLASS_FLOATING, theme::ACCENT);
+    theme::frost(painter, panel, 10, theme::floating_alpha(), theme::ACCENT);
 
     for (i, cand) in items.iter().enumerate() {
         let row_rect = Rect::from_min_size(

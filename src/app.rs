@@ -8,12 +8,23 @@ use crate::ui::dialogs::{ConnectionDialog, DialogOutcome};
 use crate::ui::sidebar_left::{self, BrowserAction};
 use crate::ui::sidebar_right::{self, InfoAction};
 use crate::ui::splash;
+use crate::platform::kwin_blur::Blur;
 use eframe::egui::{self, Color32};
+use raw_window_handle::HasWindowHandle;
 use std::collections::HashMap;
 use std::time::Instant;
 
 const MIN_SIDEBAR: f32 = 210.0;
 const MAX_SIDEBAR: f32 = 460.0;
+/// Padding inside each sidebar, in points.
+const SIDEBAR_MARGIN: egui::Margin = egui::Margin {
+    left: 14,
+    right: 14,
+    top: 10,
+    bottom: 12,
+};
+/// Height of the session tab strip above the terminal.
+const TAB_STRIP_HEIGHT: f32 = 34.0;
 
 pub struct SsclApp {
     started: Instant,
@@ -31,6 +42,9 @@ pub struct SsclApp {
     filter: String,
     font_size: f32,
     toast: Option<Toast>,
+    /// KWin backdrop blur, kept in step with the window size.
+    blur: Option<Blur>,
+    blur_ready: bool,
 }
 
 struct Toast {
@@ -57,6 +71,8 @@ impl SsclApp {
             filter: String::new(),
             font_size: 13.5,
             toast: None,
+            blur: None,
+            blur_ready: false,
         }
     }
 
@@ -167,7 +183,8 @@ impl eframe::App for SsclApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.sync_blur(ctx, frame);
         let elapsed = self.started.elapsed().as_secs_f32();
 
         // ---- Splash ------------------------------------------------------
@@ -192,6 +209,43 @@ impl eframe::App for SsclApp {
 }
 
 impl SsclApp {
+    /// Asks KWin to blur what is behind the window, and keeps the blurred
+    /// region matching the window as it is resized.
+    ///
+    /// The glass palette is chosen once, on the first frame: dense when
+    /// nothing is blurring behind us, thin when something is. `SSCL_BLUR`
+    /// (`on`, `off`, or `auto`) overrides the detection.
+    fn sync_blur(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.blur_ready {
+            self.blur_ready = true;
+            self.blur = frame
+                .window_handle()
+                .ok()
+                .and_then(|h| Blur::new(&h.as_raw()));
+
+            let forced = std::env::var("SSCL_BLUR").unwrap_or_default().to_lowercase();
+            let blurred = match forced.as_str() {
+                "on" | "1" | "true" => true,
+                "off" | "0" | "false" => false,
+                _ => self.blur.as_ref().is_some_and(Blur::announced),
+            };
+            theme::set_surface(if blurred {
+                theme::Surface::Blurred
+            } else {
+                theme::Surface::Solid
+            });
+        }
+
+        if let Some(blur) = self.blur.as_mut() {
+            let size = ctx.screen_rect().size() * ctx.pixels_per_point();
+            blur.apply(
+                size.x.round().max(0.0) as u32,
+                size.y.round().max(0.0) as u32,
+                theme::WINDOW_RADIUS,
+            );
+        }
+    }
+
     /// Global keyboard shortcuts. These are consumed here so the terminal
     /// never sees them.
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -240,6 +294,12 @@ impl SsclApp {
     }
 
     fn main_ui(&mut self, ctx: &egui::Context) {
+        // One sheet of glass under everything. The panels below paint no
+        // background of their own, so the chrome reads as a single surface
+        // divided by hairlines rather than as separate floating cards.
+        let screen = ctx.screen_rect();
+        theme::window_backdrop(&ctx.layer_painter(egui::LayerId::background()), screen);
+
         chrome::resize_handles(ctx);
 
         // ---- Top bar -----------------------------------------------------
@@ -281,14 +341,9 @@ impl SsclApp {
         let mut browser_action = None;
         if self.left_open {
             egui::SidePanel::left("sscl-left")
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                    left: 10,
-                    right: 5,
-                    top: 4,
-                    bottom: 10,
-                }))
+                .frame(egui::Frame::NONE.inner_margin(SIDEBAR_MARGIN))
                 .resizable(true)
-                .default_width(264.0)
+                .default_width(272.0)
                 .width_range(MIN_SIDEBAR..=MAX_SIDEBAR)
                 .show_separator_line(false)
                 .show(ctx, |ui| {
@@ -297,8 +352,9 @@ impl SsclApp {
                     // child Ui, which would otherwise let the resizable panel
                     // collapse to its minimum width on the next frame.
                     ui.expand_to_include_rect(rect);
-                    theme::frost(ui.painter(), rect, 16, theme::GLASS_PANEL, theme::ACCENT);
-                    let content = rect.shrink(14.0);
+                    theme::divider_v(ui.painter(), rect.max.x, rect.min.y, rect.max.y);
+
+                    let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
                     let mut inner = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(content)
@@ -327,21 +383,17 @@ impl SsclApp {
         let mut info_action = None;
         if self.right_open {
             egui::SidePanel::right("sscl-right")
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                    left: 5,
-                    right: 10,
-                    top: 4,
-                    bottom: 10,
-                }))
+                .frame(egui::Frame::NONE.inner_margin(SIDEBAR_MARGIN))
                 .resizable(true)
-                .default_width(300.0)
+                .default_width(308.0)
                 .width_range(MIN_SIDEBAR..=MAX_SIDEBAR)
                 .show_separator_line(false)
                 .show(ctx, |ui| {
                     let rect = ui.max_rect();
                     ui.expand_to_include_rect(rect);
-                    theme::frost(ui.painter(), rect, 16, theme::GLASS_PANEL, theme::ACCENT_ALT);
-                    let content = rect.shrink(14.0);
+                    theme::divider_v(ui.painter(), rect.min.x, rect.min.y, rect.max.y);
+
+                    let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
                     let mut inner = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(content)
@@ -354,24 +406,56 @@ impl SsclApp {
         }
 
         // ---- Centre page --------------------------------------------------
+        // The terminal is the one opaque surface, sitting flush against the
+        // sidebars like an editor pane. It only rounds the window corners it
+        // actually owns, which depends on which sidebars are open.
         let dialog_open = self.dialog.is_some();
+        let (left_open, right_open) = (self.left_open, self.right_open);
         let mut tab_result = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                left: 5,
-                right: 5,
-                top: 4,
-                bottom: 10,
-            }))
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.expand_to_include_rect(rect);
+
+                let mut top = rect.min.y;
+                let mut tabs_shown = false;
                 if self.sessions.len() > 1 || self.sessions.iter().any(|s| s.kind.is_remote()) {
+                    let strip = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::Pos2::new(rect.max.x, rect.min.y + TAB_STRIP_HEIGHT),
+                    );
+                    let mut strip_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(strip.shrink2(egui::Vec2::new(8.0, 5.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    strip_ui.set_clip_rect(strip);
                     let tabs: Vec<(u64, String, bool, bool)> = self
                         .sessions
                         .iter()
                         .map(|s| (s.id, s.title.clone(), s.is_alive(), s.kind.is_remote()))
                         .collect();
-                    tab_result = Some(chrome::tab_strip(ui, &tabs, self.active));
-                    ui.add_space(6.0);
+                    tab_result = Some(chrome::tab_strip(&mut strip_ui, &tabs, self.active));
+                    top = strip.max.y;
+                    tabs_shown = true;
+                }
+
+                let sheet = egui::Rect::from_min_max(
+                    egui::Pos2::new(rect.min.x, top),
+                    rect.max,
+                );
+                let radius = egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: if left_open { 0 } else { theme::WINDOW_RADIUS },
+                    se: if right_open { 0 } else { theme::WINDOW_RADIUS },
+                };
+                ui.painter().rect_filled(sheet, radius, theme::TERMINAL_BG);
+                // Without tabs the top bar's own hairline already closes this
+                // edge off; a second line there would read as a double rule.
+                if tabs_shown {
+                    theme::divider_h(ui.painter(), sheet.min.y, sheet.min.x, sheet.max.x);
                 }
 
                 let id = self.active;
@@ -379,7 +463,20 @@ impl SsclApp {
                 if let Some(id) = id {
                     let state = self.term_states.entry(id).or_default();
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                        term::show(ui, session, &mut self.suggestions, state, font_size, !dialog_open);
+                        let mut term_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(sheet)
+                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        );
+                        term_ui.set_clip_rect(sheet);
+                        term::show(
+                            &mut term_ui,
+                            session,
+                            &mut self.suggestions,
+                            state,
+                            font_size,
+                            !dialog_open,
+                        );
                     }
                 }
             });
@@ -412,15 +509,15 @@ impl SsclApp {
 
         match info_action {
             Some(InfoAction::Rescan) => {
-                if let Some(session) = self.active_session()
-                    && let Some(conn) = session.connection() {
-                        let (host, port) = (conn.host.clone(), conn.port);
-                        let handle = session.probe.clone();
+                if let Some(conn) = self.active_session().and_then(|s| s.connection()) {
+                    let (host, port) = (conn.host.clone(), conn.port);
+                    if let Some(handle) = self.active_session().map(|s| s.probe.clone()) {
                         if let Ok(mut state) = handle.state.lock() {
                             *state = crate::sshinfo::ProbeState::Idle;
                         }
                         crate::sshinfo::spawn(handle, host, port);
                     }
+                }
             }
             Some(InfoAction::Copy(text)) => {
                 ctx.copy_text(text);
@@ -494,7 +591,7 @@ impl SsclApp {
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(theme::glass(230).gamma_multiply(alpha))
+                    .fill(theme::glass(theme::floating_alpha()).gamma_multiply(alpha))
                     .stroke(egui::Stroke::new(
                         1.0,
                         toast.color.gamma_multiply(0.5 * alpha),

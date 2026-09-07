@@ -32,7 +32,7 @@ fn main() -> eframe::Result<()> {
 }
 
 /// Renders the application icon at runtime, so no binary asset is needed.
-/// A rounded violet tile carrying the `>_` prompt mark.
+/// A monochrome rounded tile carrying the `>_` prompt mark.
 fn app_icon(size: u32) -> egui::IconData {
     let s = size as f32;
     let radius = s * 0.24;
@@ -69,13 +69,16 @@ fn app_icon(size: u32) -> egui::IconData {
                 continue;
             }
 
-            // Vertical violet -> teal gradient.
+            // Vertical grey gradient, lighter at the top.
             let t = py / s;
-            let base = [
-                lerp(0x6B as f32, 0x3B as f32, t),
-                lerp(0x4A as f32, 0x86 as f32, t),
-                lerp(0xF0 as f32, 0xD8 as f32, t),
-            ];
+            let shade = lerp(0x2A as f32, 0x14 as f32, t);
+            let mut base = [shade, shade + 1.0, shade + 6.0];
+
+            // A light rim just inside the edge, to lift it off dark panels.
+            let rim = ((outside + 2.0) / 2.0).clamp(0.0, 1.0) * tile;
+            for c in &mut base {
+                *c = lerp(*c, 0x8A as f32, rim * 0.55);
+            }
 
             // Glyph coverage.
             let mut glyph = 0.0f32;
@@ -85,9 +88,9 @@ fn app_icon(size: u32) -> egui::IconData {
             }
 
             let color = [
-                lerp(base[0], 255.0, glyph),
-                lerp(base[1], 255.0, glyph),
-                lerp(base[2], 255.0, glyph),
+                lerp(base[0], 0xF2 as f32, glyph),
+                lerp(base[1], 0xF4 as f32, glyph),
+                lerp(base[2], 0xFA as f32, glyph),
             ];
 
             let i = ((y * size + x) * 4) as usize;

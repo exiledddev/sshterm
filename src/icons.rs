@@ -246,34 +246,41 @@ pub fn win_close(painter: &Painter, r: Rect, c: Color32, w: f32) {
     line(painter, vec![p(r, 0.72, 0.28), p(r, 0.28, 0.72)], c, w);
 }
 
-/// Draws the application mark: a rounded gradient tile with a `>_` prompt.
+/// Draws the application mark: a monochrome rounded tile carrying a `>_`
+/// prompt. Deliberately greyscale, so it sits quietly in a task bar or title
+/// bar next to whatever else is there.
 pub fn app_mark(painter: &Painter, rect: Rect) {
     let cr = CornerRadius::same((rect.width() * 0.26) as u8);
-    painter.rect_filled(rect, cr, Color32::from_rgb(0x5B, 0x3F, 0xE0));
-    // Cheap vertical gradient.
+    painter.rect_filled(rect, cr, Color32::from_rgb(0x1C, 0x1D, 0x24));
+
+    // A faint light falloff from the top, so the tile is not flat.
     let bands = 8;
     for i in 0..bands {
         let t = i as f32 / bands as f32;
         let band = Rect::from_min_max(
             Pos2::new(rect.min.x, rect.min.y + rect.height() * t),
-            Pos2::new(rect.max.x, rect.min.y + rect.height() * (t + 1.0 / bands as f32)),
+            Pos2::new(
+                rect.max.x,
+                rect.min.y + rect.height() * (t + 1.0 / bands as f32),
+            ),
         );
         painter.rect_filled(
             band,
             if i == 0 { cr } else { CornerRadius::ZERO },
-            Color32::from_rgba_unmultiplied(0x38, 0xE8, 0xC8, (t * 46.0) as u8),
+            Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, ((1.0 - t) * 16.0) as u8),
         );
     }
+
     painter.rect_stroke(
         rect,
         cr,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x40)),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x5A)),
         egui::StrokeKind::Inside,
     );
     terminal(
         painter,
         rect.shrink(rect.width() * 0.16),
-        Color32::WHITE,
+        Color32::from_rgb(0xEC, 0xEE, 0xF5),
         (rect.width() * 0.085).max(1.2),
     );
 }
