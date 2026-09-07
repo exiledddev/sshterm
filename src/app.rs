@@ -24,7 +24,9 @@ const SIDEBAR_MARGIN: egui::Margin = egui::Margin {
     bottom: 12,
 };
 /// Height of the session tab strip above the terminal.
-const TAB_STRIP_HEIGHT: f32 = 34.0;
+const TAB_STRIP_HEIGHT: f32 = 32.0;
+/// Height of the status bar along the bottom of the window.
+const STATUS_BAR_HEIGHT: f32 = 26.0;
 
 pub struct SsclApp {
     started: Instant,
@@ -45,6 +47,8 @@ pub struct SsclApp {
     /// KWin backdrop blur, kept in step with the window size.
     blur: Option<Blur>,
     blur_ready: bool,
+    /// What the terminal reported this frame, shown in the status bar.
+    status: crate::term::TerminalStatus,
 }
 
 struct Toast {
@@ -73,6 +77,7 @@ impl SsclApp {
             toast: None,
             blur: None,
             blur_ready: false,
+            status: Default::default(),
         }
     }
 
@@ -234,6 +239,14 @@ impl SsclApp {
             } else {
                 theme::Surface::Solid
             });
+
+            if let Some(pct) = std::env::var("SSCL_OPACITY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .filter(|p| (1..=100).contains(p))
+            {
+                theme::set_opacity_percent(pct);
+            }
         }
 
         if let Some(blur) = self.blur.as_mut() {
@@ -273,6 +286,9 @@ impl SsclApp {
         }
         if hit(ctx, cs, Key::T) {
             self.open_local(ctx);
+        }
+        if hit(ctx, cs, Key::P) {
+            crate::privacy::toggle();
         }
         if hit(ctx, Modifiers::CTRL, Key::Plus) || hit(ctx, Modifiers::CTRL, Key::Equals) {
             self.font_size = (self.font_size + 0.5).min(28.0);
@@ -337,6 +353,24 @@ impl SsclApp {
             self.right_open = !self.right_open;
         }
 
+        // ---- Status bar ---------------------------------------------------
+        // Full width, along the bottom, part of the same glass. Everything
+        // that used to float over the terminal lives here instead.
+        egui::TopBottomPanel::bottom("sscl-status")
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 4,
+                bottom: 6,
+            }))
+            .show_separator_line(false)
+            .exact_height(STATUS_BAR_HEIGHT)
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.expand_to_include_rect(rect);
+                self.status_bar(ui);
+            });
+
         // ---- Left sidebar -------------------------------------------------
         let mut browser_action = None;
         if self.left_open {
@@ -352,7 +386,6 @@ impl SsclApp {
                     // child Ui, which would otherwise let the resizable panel
                     // collapse to its minimum width on the next frame.
                     ui.expand_to_include_rect(rect);
-                    theme::divider_v(ui.painter(), rect.max.x, rect.min.y, rect.max.y);
 
                     let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
                     let mut inner = ui.new_child(
@@ -369,13 +402,8 @@ impl SsclApp {
                             .find(|s| s.connection().map(|c| c.dir == conn.dir).unwrap_or(false))
                             .map(|s| (s.id, s.is_alive()))
                     };
-                    browser_action = sidebar_left::show(
-                        &mut inner,
-                        &self.connections,
-                        &running,
-                        &mut self.filter,
-                        &self.suggestions,
-                    );
+                    browser_action =
+                        sidebar_left::show(&mut inner, &self.connections, &running, &mut self.filter);
                 });
         }
 
@@ -391,7 +419,6 @@ impl SsclApp {
                 .show(ctx, |ui| {
                     let rect = ui.max_rect();
                     ui.expand_to_include_rect(rect);
-                    theme::divider_v(ui.painter(), rect.min.x, rect.min.y, rect.max.y);
 
                     let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
                     let mut inner = ui.new_child(
@@ -406,12 +433,11 @@ impl SsclApp {
         }
 
         // ---- Centre page --------------------------------------------------
-        // The terminal is the one opaque surface, sitting flush against the
-        // sidebars like an editor pane. It only rounds the window corners it
-        // actually owns, which depends on which sidebars are open.
+        // The terminal is an island: opaque, rounded, and inset from the
+        // chrome on every side so the glass shows around it.
         let dialog_open = self.dialog.is_some();
-        let (left_open, right_open) = (self.left_open, self.right_open);
         let mut tab_result = None;
+        let mut status = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -419,15 +445,14 @@ impl SsclApp {
                 ui.expand_to_include_rect(rect);
 
                 let mut top = rect.min.y;
-                let mut tabs_shown = false;
                 if self.sessions.len() > 1 || self.sessions.iter().any(|s| s.kind.is_remote()) {
                     let strip = egui::Rect::from_min_max(
-                        rect.min,
-                        egui::Pos2::new(rect.max.x, rect.min.y + TAB_STRIP_HEIGHT),
+                        egui::Pos2::new(rect.min.x + theme::GAP, rect.min.y),
+                        egui::Pos2::new(rect.max.x - theme::GAP, rect.min.y + TAB_STRIP_HEIGHT),
                     );
                     let mut strip_ui = ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(strip.shrink2(egui::Vec2::new(8.0, 5.0)))
+                            .max_rect(strip.shrink2(egui::Vec2::new(0.0, 3.0)))
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
                     strip_ui.set_clip_rect(strip);
@@ -438,25 +463,12 @@ impl SsclApp {
                         .collect();
                     tab_result = Some(chrome::tab_strip(&mut strip_ui, &tabs, self.active));
                     top = strip.max.y;
-                    tabs_shown = true;
                 }
 
-                let sheet = egui::Rect::from_min_max(
-                    egui::Pos2::new(rect.min.x, top),
-                    rect.max,
+                let island = egui::Rect::from_min_max(
+                    egui::Pos2::new(rect.min.x + theme::GAP, top + theme::GAP),
+                    egui::Pos2::new(rect.max.x - theme::GAP, rect.max.y),
                 );
-                let radius = egui::CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: if left_open { 0 } else { theme::WINDOW_RADIUS },
-                    se: if right_open { 0 } else { theme::WINDOW_RADIUS },
-                };
-                ui.painter().rect_filled(sheet, radius, theme::TERMINAL_BG);
-                // Without tabs the top bar's own hairline already closes this
-                // edge off; a second line there would read as a double rule.
-                if tabs_shown {
-                    theme::divider_h(ui.painter(), sheet.min.y, sheet.min.x, sheet.max.x);
-                }
 
                 let id = self.active;
                 let font_size = self.font_size;
@@ -465,21 +477,24 @@ impl SsclApp {
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                         let mut term_ui = ui.new_child(
                             egui::UiBuilder::new()
-                                .max_rect(sheet)
+                                .max_rect(island)
                                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
                         );
-                        term_ui.set_clip_rect(sheet);
-                        term::show(
+                        term_ui.set_clip_rect(island);
+                        status = Some(term::show(
                             &mut term_ui,
                             session,
                             &mut self.suggestions,
                             state,
                             font_size,
                             !dialog_open,
-                        );
+                        ));
                     }
                 }
             });
+        if let Some(status) = status {
+            self.status = status;
+        }
 
         // ---- Act on what the panels reported ------------------------------
         if let Some(result) = tab_result {
@@ -527,6 +542,95 @@ impl SsclApp {
         }
 
         self.dialog_ui(ctx);
+    }
+
+    /// The bottom status bar: what session is on screen, and whatever the
+    /// terminal wants to say.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+        let mono = egui::FontId::new(10.5, egui::FontFamily::Monospace);
+
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+
+            if let Some(session) = self.active_session() {
+                let (icon, tint): (crate::icons::Icon, Color32) = if session.kind.is_remote() {
+                    (crate::icons::server, theme::ACCENT_ALT)
+                } else {
+                    (crate::icons::terminal, theme::TEXT_DIM)
+                };
+                let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+                icon(ui.painter(), r, tint, 1.3);
+                ui.label(
+                    egui::RichText::new(&session.title)
+                        .font(font.clone())
+                        .color(theme::TEXT_DIM),
+                );
+                if !session.subtitle.is_empty() {
+                    ui.label(
+                        egui::RichText::new(crate::privacy::mask(&session.subtitle))
+                            .font(mono.clone())
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+            }
+            if self.status.cols > 0 {
+                ui.label(
+                    egui::RichText::new(format!("{}×{}", self.status.cols, self.status.rows))
+                        .font(mono.clone())
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+
+                let suggestions = if self.suggestions.is_scanning() {
+                    "indexing $PATH…".to_string()
+                } else {
+                    format!(
+                        "{} cmds · {} history",
+                        self.suggestions.command_count(),
+                        self.suggestions.history_count()
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(suggestions)
+                        .font(font.clone())
+                        .color(theme::TEXT_FAINT),
+                );
+
+                if let Some(note) = self.status.exit_note.clone() {
+                    ui.label(
+                        egui::RichText::new(note)
+                            .font(font.clone())
+                            .color(theme::DANGER),
+                    );
+                } else if self.status.scrollback > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "scrollback −{}  ·  End to follow",
+                            self.status.scrollback
+                        ))
+                        .font(font.clone())
+                        .color(theme::WARN),
+                    );
+                } else if self.status.copied {
+                    ui.label(
+                        egui::RichText::new("copied")
+                            .font(font.clone())
+                            .color(theme::ACCENT_ALT),
+                    );
+                    ui.ctx().request_repaint();
+                } else if !self.status.focused && self.active.is_some() {
+                    ui.label(
+                        egui::RichText::new("click the terminal to type")
+                            .font(font.clone())
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+            });
+        });
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {

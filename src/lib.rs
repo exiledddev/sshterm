@@ -7,6 +7,7 @@
 pub mod app;
 pub mod icons;
 pub mod platform;
+pub mod privacy;
 pub mod sshinfo;
 pub mod store;
 pub mod term;
