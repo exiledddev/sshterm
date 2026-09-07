@@ -127,7 +127,7 @@ impl ConnectionDialog {
             .backdrop_color(Color32::from_black_alpha(150))
             .frame(
                 egui::Frame::new()
-                    .fill(theme::glass(theme::GLASS_FLOATING))
+                    .fill(theme::glass(theme::floating_alpha()))
                     .stroke(Stroke::new(
                         1.0,
                         Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x28),

@@ -180,18 +180,64 @@ sscl-probe example.com 22
 
 ## Design notes
 
-Everything except the terminal is a translucent glass panel on a genuinely
-transparent, borderless window, so the desktop shows through. Whether the
-backdrop is also *blurred* is up to your compositor: KWin blurs translucent
-windows, and GNOME can with an extension such as Blur-my-Shell. Where the
-compositor does not blur, the panels stay translucent and carry a frosted sheen
-of their own — SSCL cannot blur what it cannot read back.
+Everything except the terminal is a single sheet of translucent glass: the
+title bar, the ribbon, both sidebars and the space between them are one
+surface, divided by hairlines rather than by gaps and borders — the layout
+JetBrains' newer IDEs use. The terminal is the one opaque pane, sitting flush
+against the sidebars like an editor area, and only rounds the window corners it
+actually owns at the time. The window itself is genuinely transparent, so the
+desktop shows through the glass.
+
+### Backdrop blur
+
+On **KDE Plasma (X11)** SSCL asks KWin to blur what is behind it, by setting
+`_KDE_NET_WM_BLUR_BEHIND_REGION` on its own window. The region follows the
+window's rounded corners and is updated when the window is resized, so the blur
+does not spill out as a hard square behind them. Nothing to configure — as long
+as KWin's Blur desktop effect is enabled (*System Settings → Desktop Effects*),
+it just works.
+
+The glass then adapts to what it is sitting on:
+
+| | |
+| --- | --- |
+| **Blur active** | thin glass, so the blurred desktop reads through it |
+| **No blur** | dense glass, so a busy wallpaper can never interfere with the text |
+
+SSCL picks between them by asking the X server whether a compositor has
+announced the blur effect. Override it with `SSCL_BLUR`:
+
+```sh
+SSCL_BLUR=on   sscl   # force the thin glass
+SSCL_BLUR=off  sscl   # force the dense glass
+SSCL_BLUR=auto sscl   # detect (the default)
+```
+
+On a **Plasma Wayland** session the equivalent is a Wayland protocol that winit
+does not expose, so SSCL cannot ask for blur itself and falls back to the dense
+glass. Two things get the blur back:
+
+```sh
+WINIT_UNIX_BACKEND=x11 sscl        # run under XWayland, where the property works
+```
+
+or install [Force Blur](https://github.com/taj-ny/kwin-effects-forceblur) and
+add `sscl` to its window list — that blurs the window from KWin's side, on both
+session types. Pair either with `SSCL_BLUR=on`.
+
+On other desktops the property is simply ignored. GNOME can blur with the
+Blur my Shell extension (its *Applications* component); everywhere else the
+dense glass keeps the app translucent and readable.
+
+### Chrome and assets
 
 Because the window is borderless, SSCL draws its own title bar: drag it to move
 the window, double-click to maximise, and the window edges are resize handles.
 
 Icons are drawn with vector primitives at runtime and the fonts are the ones
-egui bundles, so the binary needs no image or font assets.
+egui bundles, so the binary needs no image or font assets. The application icon
+is monochrome — a dark rounded tile with a `>_` prompt — so it sits quietly in a
+task bar next to everything else.
 
 ## Development
 
@@ -216,6 +262,7 @@ Layout:
 | `src/term/` | PTY sessions, the terminal widget, autosuggestions |
 | `src/ui/` | splash, window chrome, sidebars, dialogs, widgets |
 | `src/theme.rs`, `src/icons.rs` | palette, glass surfaces, vector icons |
+| `src/platform/kwin_blur.rs` | the KWin backdrop-blur region |
 
 ## Licence
 

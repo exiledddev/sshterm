@@ -38,25 +38,28 @@ pub fn top_bar(ctx: &egui::Context, cx: &RibbonContext<'_>) -> RibbonActions {
 
     egui::TopBottomPanel::top("sscl-top")
         .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-            left: 10,
-            right: 10,
-            top: 10,
-            bottom: 4,
+            left: 14,
+            right: 14,
+            top: 8,
+            bottom: 8,
         }))
         .show_separator_line(false)
-        .exact_height(102.0)
+        .exact_height(92.0)
         .show(ctx, |ui| {
+            // No background of its own: the title bar and ribbon sit directly
+            // on the window's glass, closed off by a hairline.
             let rect = ui.max_rect();
-            theme::frost(ui.painter(), rect, 16, theme::GLASS_BAR, theme::ACCENT);
+            ui.expand_to_include_rect(rect);
+            theme::divider_h(ui.painter(), rect.max.y, rect.min.x, rect.max.x);
 
-            let inner = rect.shrink2(Vec2::new(12.0, 9.0));
+            let inner = rect.shrink2(Vec2::new(0.0, 2.0));
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(inner)
                     .layout(egui::Layout::top_down(egui::Align::LEFT)),
             );
             title_row(&mut child, ctx, cx);
-            child.add_space(6.0);
+            child.add_space(8.0);
             ribbon_row(&mut child, cx, &mut actions);
         });
 

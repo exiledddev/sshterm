@@ -9,6 +9,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Shadow, Stroke, TextStyle,
     Ui, Vec2,
 };
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -42,12 +43,58 @@ pub fn glass(alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(0x11, 0x12, 0x1B, alpha)
 }
 
-/// Alpha used for the large chrome surfaces.
-pub const GLASS_PANEL: u8 = 170;
-/// Alpha used for floating surfaces (dialogs, popups) which need more contrast.
-pub const GLASS_FLOATING: u8 = 224;
-/// Alpha used for the thin title bar.
-pub const GLASS_BAR: u8 = 150;
+/// Corner radius of the window itself.
+pub const WINDOW_RADIUS: u8 = 12;
+
+/// How much the compositor is helping us.
+///
+/// When KWin is blurring what is behind the window, the glass can be thin and
+/// the desktop reads as a soft wash. When nothing is blurring, the same alpha
+/// would let a busy wallpaper show straight through the text, so the glass is
+/// made much denser instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    /// A compositor is blurring the backdrop.
+    Blurred,
+    /// No blur: darken the glass so text stays legible over anything.
+    Solid,
+}
+
+static SURFACE: AtomicU8 = AtomicU8::new(1);
+
+/// Chooses the glass density. Call once, before the first frame.
+pub fn set_surface(surface: Surface) {
+    SURFACE.store(
+        match surface {
+            Surface::Blurred => 0,
+            Surface::Solid => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn surface() -> Surface {
+    match SURFACE.load(Ordering::Relaxed) {
+        0 => Surface::Blurred,
+        _ => Surface::Solid,
+    }
+}
+
+/// Alpha of the single window-wide glass sheet.
+pub fn backdrop_alpha() -> u8 {
+    match surface() {
+        Surface::Blurred => 168,
+        Surface::Solid => 238,
+    }
+}
+
+/// Alpha of surfaces that float above it: dialogs, popups, the splash card.
+pub fn floating_alpha() -> u8 {
+    match surface() {
+        Surface::Blurred => 214,
+        Surface::Solid => 246,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Global style
@@ -69,7 +116,7 @@ pub fn install(ctx: &egui::Context) {
     let v = &mut style.visuals;
     v.dark_mode = true;
     v.panel_fill = Color32::TRANSPARENT;
-    v.window_fill = glass(GLASS_FLOATING);
+    v.window_fill = glass(floating_alpha());
     v.extreme_bg_color = Color32::from_rgba_unmultiplied(0x08, 0x09, 0x11, 0xC8);
     v.faint_bg_color = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x0A);
     // Left unset so egui can derive a properly dimmed colour for hint text
@@ -136,19 +183,71 @@ pub fn install(ctx: &egui::Context) {
 }
 
 // ---------------------------------------------------------------------------
-// Glass drawing
+// Surfaces
 // ---------------------------------------------------------------------------
 
-/// Paints a frosted-glass surface: a translucent base, a soft vertical
-/// light gradient, an accent bloom and a bright top hairline. Real
-/// backdrop blur is a compositor feature; this reproduces the *look* of
-/// frosted glass on top of genuine window transparency.
+/// Paints the one glass sheet the whole window sits on.
+///
+/// Everything except the terminal shares this single surface: the title bar,
+/// the ribbon, both sidebars and the gutters between them are all the same
+/// pane of glass, divided by hairlines rather than by gaps.
+pub fn window_backdrop(painter: &egui::Painter, rect: Rect) {
+    let cr = CornerRadius::same(WINDOW_RADIUS);
+    painter.rect_filled(rect, cr, glass(backdrop_alpha()));
+
+    // A single soft highlight running down from the top edge, so the sheet
+    // reads as glass rather than as flat paint.
+    let bands = 26;
+    let height = (rect.height() * 0.28).min(180.0);
+    for i in 0..bands {
+        let t0 = i as f32 / bands as f32;
+        let t1 = (i + 1) as f32 / bands as f32;
+        let falloff = (1.0 - t0).powf(2.2);
+        let a = falloff * sheen_strength();
+        if a < 0.6 {
+            continue;
+        }
+        let band = Rect::from_min_max(
+            Pos2::new(rect.min.x, rect.min.y + height * t0),
+            Pos2::new(rect.max.x, rect.min.y + height * t1),
+        );
+        let mix = falloff * 0.7;
+        let color = Color32::from_rgba_unmultiplied(
+            lerp_u8(0xFF, ACCENT.r(), mix),
+            lerp_u8(0xFF, ACCENT.g(), mix),
+            lerp_u8(0xFF, ACCENT.b(), mix),
+            a as u8,
+        );
+        let corner = if i == 0 {
+            CornerRadius { nw: WINDOW_RADIUS, ne: WINDOW_RADIUS, sw: 0, se: 0 }
+        } else {
+            CornerRadius::ZERO
+        };
+        painter.rect_filled(band, corner, color);
+    }
+
+    painter.rect_stroke(
+        rect,
+        cr,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x22)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// With real blur behind the window the painted sheen is redundant, so it is
+/// dialled back; without blur it does the work on its own.
+fn sheen_strength() -> f32 {
+    match surface() {
+        Surface::Blurred => 14.0,
+        Surface::Solid => 24.0,
+    }
+}
+
+/// Paints a floating frosted surface: dialogs, popups, the splash card.
 pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8, tint: Color32) {
     let cr = CornerRadius::same(radius);
     painter.rect_filled(rect, cr, glass(alpha));
 
-    // Frosted sheen: a vertical light falloff tinted with the accent colour,
-    // drawn as full-width bands so it can never escape the rounded shape.
     let bands = 24;
     for i in 0..bands {
         let t0 = i as f32 / bands as f32;
@@ -162,7 +261,6 @@ pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8, tint: C
             Pos2::new(rect.min.x, rect.min.y + rect.height() * t0),
             Pos2::new(rect.max.x, rect.min.y + rect.height() * t1),
         );
-        // Blend white light towards the accent colour near the top edge.
         let mix = falloff * 0.75;
         let color = Color32::from_rgba_unmultiplied(
             lerp_u8(0xFF, tint.r(), mix),
@@ -184,8 +282,6 @@ pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8, tint: C
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x1E)),
         egui::StrokeKind::Inside,
     );
-
-    // Bright specular line along the top edge.
     painter.line_segment(
         [
             Pos2::new(rect.min.x + radius as f32, rect.min.y + 0.5),
@@ -197,6 +293,27 @@ pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8, tint: C
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
+}
+
+/// The hairline that divides one region of the glass from the next.
+pub fn divider_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x1A)
+}
+
+/// A vertical divider between two panels.
+pub fn divider_v(painter: &egui::Painter, x: f32, y0: f32, y1: f32) {
+    painter.line_segment(
+        [Pos2::new(x, y0), Pos2::new(x, y1)],
+        Stroke::new(1.0, divider_color()),
+    );
+}
+
+/// A horizontal divider between two panels.
+pub fn divider_h(painter: &egui::Painter, y: f32, x0: f32, x1: f32) {
+    painter.line_segment(
+        [Pos2::new(x0, y), Pos2::new(x1, y)],
+        Stroke::new(1.0, divider_color()),
+    );
 }
 
 /// Horizontal hairline separator.

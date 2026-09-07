@@ -49,7 +49,7 @@ pub fn draw(ctx: &egui::Context, elapsed: f32) {
                 painter,
                 card,
                 24,
-                (238.0 * fade) as u8,
+                (theme::floating_alpha() as f32 * fade) as u8,
                 theme::ACCENT.gamma_multiply(fade),
             );
 
