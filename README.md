@@ -57,6 +57,14 @@ sessions and uses `ssh-keyscan` to retrieve host keys.
 `Ctrl+Shift+T` opens another local shell. `Ctrl+±` and `Ctrl+0` change the
 terminal font size.
 
+### Hiding your details
+
+The eye button in the Session Browser header, or `Ctrl+Shift+P`, masks every
+address, user name, key file name and host-key fingerprint in the sidebars, the
+title bar and the status bar — for screen-sharing, or for a screenshot in a bug
+report. Only SSCL's own chrome is masked: the terminal shows whatever the
+remote host sends, and SSCL does not rewrite that.
+
 ## Saving a connection
 
 **New Connection** asks for four things:
@@ -180,13 +188,20 @@ sscl-probe example.com 22
 
 ## Design notes
 
-Everything except the terminal is a single sheet of translucent glass: the
-title bar, the ribbon, both sidebars and the space between them are one
-surface, divided by hairlines rather than by gaps and borders — the layout
-JetBrains' newer IDEs use. The terminal is the one opaque pane, sitting flush
-against the sidebars like an editor area, and only rounds the window corners it
-actually owns at the time. The window itself is genuinely transparent, so the
-desktop shows through the glass.
+The window is one flat, low-opacity sheet of glass — no gradients, no colour
+tint, just a neutral wash with a hairline edge, the way JetBrains' newer UI
+treats its window background. The title bar, the ribbon, both sidebars, the
+status bar and the space between them all share it, with no dividers.
+
+The terminal is the exception: an opaque island, inset from the chrome on every
+side, with rounded corners and a thin outline, the way an editor pane sits in
+those same IDEs. It is the only surface with a background of its own, so it is
+the only thing the eye has to find.
+
+Along the bottom is a status bar spanning the full width: which session is on
+screen, the terminal's grid size, and whatever the terminal wants to say —
+scrollback position, a copy confirmation, how a session ended. None of it
+floats over the terminal any more.
 
 ### Backdrop blur
 
@@ -213,6 +228,13 @@ SSCL_BLUR=off  sscl   # force the dense glass
 SSCL_BLUR=auto sscl   # detect (the default)
 ```
 
+To set the opacity yourself and ignore all of that, give `SSCL_OPACITY` a
+percentage — lower is more see-through:
+
+```sh
+SSCL_OPACITY=55 sscl
+```
+
 On a **Plasma Wayland** session the equivalent is a Wayland protocol that winit
 does not expose, so SSCL cannot ask for blur itself and falls back to the dense
 glass. Two things get the blur back:
@@ -236,8 +258,18 @@ the window, double-click to maximise, and the window edges are resize handles.
 
 Icons are drawn with vector primitives at runtime and the fonts are the ones
 egui bundles, so the binary needs no image or font assets. The application icon
-is monochrome — a dark rounded tile with a `>_` prompt — so it sits quietly in a
-task bar next to everything else.
+is monochrome — a grey rounded tile with a `>_` prompt — so it sits quietly in a
+task bar next to everything else. A unit test asserts every visible pixel of it
+stays grey, so it cannot drift back to a colour.
+
+If a launcher still shows an older, coloured icon after an update, it is
+caching it. Reinstall and clear the cache:
+
+```sh
+./install.sh
+rm -rf ~/.cache/icon-cache.kcache        # KDE
+kbuildsycoca6 2>/dev/null || kbuildsycoca5
+```
 
 ## Development
 
@@ -263,6 +295,7 @@ Layout:
 | `src/ui/` | splash, window chrome, sidebars, dialogs, widgets |
 | `src/theme.rs`, `src/icons.rs` | palette, glass surfaces, vector icons |
 | `src/platform/kwin_blur.rs` | the KWin backdrop-blur region |
+| `src/privacy.rs` | masking of addresses, user names and key files |
 
 ## Licence
 

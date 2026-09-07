@@ -46,11 +46,10 @@ pub fn top_bar(ctx: &egui::Context, cx: &RibbonContext<'_>) -> RibbonActions {
         .show_separator_line(false)
         .exact_height(92.0)
         .show(ctx, |ui| {
-            // No background of its own: the title bar and ribbon sit directly
-            // on the window's glass, closed off by a hairline.
+            // No background and no border of its own: the title bar and the
+            // ribbon sit directly on the window's glass.
             let rect = ui.max_rect();
             ui.expand_to_include_rect(rect);
-            theme::divider_h(ui.painter(), rect.max.y, rect.min.x, rect.max.x);
 
             let inner = rect.shrink2(Vec2::new(0.0, 2.0));
             let mut child = ui.new_child(
@@ -125,7 +124,10 @@ fn title_row(ui: &mut egui::Ui, ctx: &egui::Context, cx: &RibbonContext<'_>) {
                 );
                 if !cx.session_subtitle.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("· {}", cx.session_subtitle))
+                        egui::RichText::new(format!(
+                            "· {}",
+                            crate::privacy::mask(cx.session_subtitle)
+                        ))
                             .font(FontId::new(11.5, FontFamily::Monospace))
                             .color(theme::TEXT_FAINT),
                     );

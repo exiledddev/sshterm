@@ -129,14 +129,14 @@ fn remote_info(
     widgets::info_row(
         ui,
         "IP address",
-        info.ip.as_deref().unwrap_or(&info.host),
+        &crate::privacy::mask(info.ip.as_deref().unwrap_or(&info.host)),
         true,
     );
     if info.ip.as_deref() != Some(info.host.as_str()) && !info.host.is_empty() {
-        widgets::info_row(ui, "Host", &info.host, true);
+        widgets::info_row(ui, "Host", &crate::privacy::mask(&info.host), true);
     }
     widgets::info_row(ui, "Port", &info.port.to_string(), true);
-    widgets::info_row(ui, "User", &session.subtitle, true);
+    widgets::info_row(ui, "User", &crate::privacy::mask(&session.subtitle), true);
     widgets::info_row(ui, "Opened", &session.started, false);
     ui.add_space(6.0);
 
@@ -248,7 +248,8 @@ fn remote_info(
             }
         });
         ui.add_space(2.0);
-        let fp = egui::RichText::new(&key.fingerprint)
+        let shown = crate::privacy::mask_opaque(&key.fingerprint);
+        let fp = egui::RichText::new(&shown)
             .font(FontId::new(10.5, FontFamily::Monospace))
             .color(theme::ACCENT_ALT);
         if ui

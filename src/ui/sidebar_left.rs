@@ -30,7 +30,6 @@ pub fn show(
     connections: &[Connection],
     running: &dyn Fn(&Connection) -> Option<(u64, bool)>,
     filter: &mut String,
-    suggestions: &crate::term::suggest::Suggestions,
 ) -> Option<BrowserAction> {
     let mut action = None;
 
@@ -45,6 +44,19 @@ pub fn show(
                 .clicked()
             {
                 action = Some(BrowserAction::New);
+            }
+            let censored = crate::privacy::is_censored();
+            if widgets::icon_button(
+                ui,
+                icons::eye_off,
+                24.0,
+                if censored { theme::WARN } else { theme::TEXT_DIM },
+                censored,
+                "Hide addresses, user names and key files  (Ctrl+Shift+P)",
+            )
+            .clicked()
+            {
+                crate::privacy::toggle();
             }
         });
     });
@@ -71,18 +83,7 @@ pub fn show(
         ui.add_space(8.0);
     }
 
-    // Reserve a footer strip, then let the list fill what is left.
-    let avail = ui.available_rect_before_wrap();
-    let footer_h = 18.0;
-    let list_rect = egui::Rect::from_min_max(
-        avail.min,
-        Pos2::new(avail.right(), (avail.bottom() - footer_h - 8.0).max(avail.top())),
-    );
-    let footer_rect = egui::Rect::from_min_max(
-        Pos2::new(avail.left(), avail.bottom() - footer_h),
-        avail.max,
-    );
-
+    let list_rect = ui.available_rect_before_wrap();
     let needle = filter.to_lowercase();
     ui.scope_builder(
         egui::UiBuilder::new()
@@ -116,41 +117,7 @@ pub fn show(
         },
     );
 
-    footer(ui, footer_rect, suggestions);
     action
-}
-
-/// A quiet status line describing the autosuggestion database.
-fn footer(ui: &mut egui::Ui, rect: Rect, suggestions: &crate::term::suggest::Suggestions) {
-    let text = if suggestions.is_scanning() {
-        "indexing $PATH…".to_string()
-    } else {
-        format!(
-            "{} cmds · {} history",
-            suggestions.command_count(),
-            suggestions.history_count()
-        )
-    };
-    let font = FontId::new(10.0, FontFamily::Proportional);
-    let text = elide(ui.ctx(), &text, font.clone(), rect.width());
-    let painter = ui.painter();
-    painter.line_segment(
-        [
-            Pos2::new(rect.left(), rect.top() - 5.0),
-            Pos2::new(rect.right(), rect.top() - 5.0),
-        ],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x12)),
-    );
-    painter.text(
-        Pos2::new(rect.left(), rect.center().y),
-        Align2::LEFT_CENTER,
-        text,
-        font,
-        theme::TEXT_FAINT,
-    );
-    if suggestions.is_scanning() {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(400));
-    }
 }
 
 fn empty_state(ui: &mut egui::Ui, action: &mut Option<BrowserAction>) {
@@ -263,7 +230,7 @@ fn card(
         Align2::LEFT_CENTER,
         elide(
             ui.ctx(),
-            &format!("{}@{}", conn.username, conn.host),
+            &crate::privacy::mask(&format!("{}@{}", conn.username, conn.host)),
             target_font.clone(),
             (rect.max.x - 12.0 - text_left).max(20.0),
         ),
@@ -320,7 +287,7 @@ fn card(
             Align2::LEFT_CENTER,
             elide(
                 ui.ctx(),
-                &conn.key_file,
+                &crate::privacy::mask(&conn.key_file),
                 key_font.clone(),
                 (buttons_left - 8.0 - key_left).max(16.0),
             ),
@@ -360,7 +327,7 @@ fn card(
     let _ = start_resp.on_hover_text(format!(
         "Start{}\n{}",
         if live { " another session" } else { "" },
-        conn.command_preview()
+        crate::privacy::mask(&conn.command_preview())
     ));
 
     action

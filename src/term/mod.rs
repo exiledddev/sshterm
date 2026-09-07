@@ -71,6 +71,17 @@ fn metrics(ctx: &egui::Context, size: f32) -> Metrics {
     }
 }
 
+/// What the status bar should say about this terminal.
+#[derive(Default)]
+pub struct TerminalStatus {
+    pub cols: u16,
+    pub rows: u16,
+    pub scrollback: usize,
+    pub exit_note: Option<String>,
+    pub focused: bool,
+    pub copied: bool,
+}
+
 /// Draws the terminal page and handles all of its input.
 pub fn show(
     ui: &mut Ui,
@@ -79,7 +90,7 @@ pub fn show(
     state: &mut TerminalState,
     font_size: f32,
     enabled: bool,
-) {
+) -> TerminalStatus {
     let rect = ui.max_rect();
     let id = ui.make_persistent_id(("sscl-terminal", session.id));
     let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -101,9 +112,12 @@ pub fn show(
     }
     let focused = enabled && response.has_focus();
 
-    // The opaque dark-grey sheet required by the blueprint.
+    // The opaque dark-grey island the blueprint requires, inset from the
+    // surrounding glass and outlined, like an editor pane.
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::same(12), theme::TERMINAL_BG);
+    let island = CornerRadius::same(theme::ISLAND_RADIUS);
+    painter.rect_filled(rect, island, theme::island_fill());
+    painter.rect_stroke(rect, island, theme::island_stroke(), egui::StrokeKind::Inside);
 
     let m = metrics(ui.ctx(), font_size);
     let grid_origin = rect.min + Vec2::splat(PAD);
@@ -117,7 +131,7 @@ pub fn show(
     // ---- 2. Draw the screen ---------------------------------------------
     let screen_info = {
         let Ok(parser) = session.parser.lock() else {
-            return;
+            return TerminalStatus::default();
         };
         let screen = parser.screen();
         draw_screen(&painter, screen, &m, grid_origin, state);
@@ -156,8 +170,6 @@ pub fn show(
         }
     }
 
-    draw_overlays(ui, &painter, rect, session, state, focused);
-
     // ---- 3. Input, applied after drawing so the mirror stays in step -----
     if focused {
         handle_keyboard(ui, session, suggestions, state, &screen_info);
@@ -169,6 +181,25 @@ pub fn show(
     if focused && !screen_info.hide_cursor {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    TerminalStatus {
+        cols,
+        rows,
+        scrollback: session.scroll,
+        exit_note: if session.is_alive() {
+            None
+        } else {
+            Some(
+                session
+                    .exit_note()
+                    .unwrap_or_else(|| "Session ended.".to_string()),
+            )
+        },
+        focused,
+        copied: state
+            .last_copy
+            .is_some_and(|t| ui.input(|i| i.time) - t < 1.6),
     }
 }
 
@@ -429,7 +460,7 @@ fn draw_candidates(
         CornerRadius::same(10),
         Color32::from_black_alpha(90),
     );
-    theme::frost(painter, panel, 10, theme::floating_alpha(), theme::ACCENT);
+    theme::frost(painter, panel, 10, theme::floating_alpha());
 
     for (i, cand) in items.iter().enumerate() {
         let row_rect = Rect::from_min_size(
@@ -459,58 +490,6 @@ fn draw_candidates(
             tag_font.clone(),
             theme::TEXT_FAINT,
         );
-    }
-}
-
-/// Status chips drawn over the terminal sheet.
-fn draw_overlays(
-    ui: &mut Ui,
-    painter: &egui::Painter,
-    rect: Rect,
-    session: &PtySession,
-    state: &TerminalState,
-    focused: bool,
-) {
-    let mut chips: Vec<(String, Color32)> = Vec::new();
-    if session.scroll > 0 {
-        chips.push((
-            format!("scrollback −{}  ·  press End to follow", session.scroll),
-            theme::WARN,
-        ));
-    }
-    if !session.is_alive() {
-        chips.push((
-            session
-                .exit_note()
-                .unwrap_or_else(|| "Session ended.".to_string()),
-            theme::DANGER,
-        ));
-    } else if !focused {
-        chips.push(("click to type".to_string(), theme::TEXT_FAINT));
-    }
-    if let Some(t) = state.last_copy
-        && ui.input(|i| i.time) - t < 1.6 {
-            chips.push(("copied".to_string(), theme::ACCENT_ALT));
-            ui.ctx().request_repaint();
-        }
-
-    let font = FontId::new(11.5, FontFamily::Proportional);
-    let mut y = rect.max.y - 12.0;
-    for (text, color) in chips.iter().rev() {
-        let galley = ui
-            .ctx()
-            .fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), *color));
-        let size = galley.rect.size() + Vec2::new(20.0, 10.0);
-        let chip = Rect::from_min_size(Pos2::new(rect.max.x - 12.0 - size.x, y - size.y), size);
-        painter.rect_filled(chip, CornerRadius::same(255), Color32::from_black_alpha(150));
-        painter.rect_stroke(
-            chip,
-            CornerRadius::same(255),
-            Stroke::new(1.0, color.gamma_multiply(0.5)),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(chip.center() - galley.rect.size() / 2.0, galley, *color);
-        y -= size.y + 6.0;
     }
 }
 

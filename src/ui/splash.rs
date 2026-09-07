@@ -45,13 +45,7 @@ pub fn draw(ctx: &egui::Context, elapsed: f32) {
                 CornerRadius::same(28),
                 Color32::from_black_alpha((110.0 * fade) as u8),
             );
-            theme::frost(
-                painter,
-                card,
-                24,
-                (theme::floating_alpha() as f32 * fade) as u8,
-                theme::ACCENT.gamma_multiply(fade),
-            );
+            theme::frost(painter, card, 24, (theme::floating_alpha() as f32 * fade) as u8);
 
             let fade_c = |c: Color32| c.gamma_multiply(fade);
 

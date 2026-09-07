@@ -45,6 +45,10 @@ pub fn glass(alpha: u8) -> Color32 {
 
 /// Corner radius of the window itself.
 pub const WINDOW_RADIUS: u8 = 12;
+/// Corner radius of the terminal island.
+pub const ISLAND_RADIUS: u8 = 10;
+/// Space between the island and the chrome around it.
+pub const GAP: f32 = 10.0;
 
 /// How much the compositor is helping us.
 ///
@@ -80,20 +84,41 @@ pub fn surface() -> Surface {
     }
 }
 
+/// Explicit opacity, 0-100, from `SSCL_OPACITY`. Zero means "not set".
+static OPACITY: AtomicU8 = AtomicU8::new(0);
+
+/// Overrides the glass density entirely. `percent` is 1-100.
+pub fn set_opacity_percent(percent: u8) {
+    OPACITY.store(percent.min(100), Ordering::Relaxed);
+}
+
 /// Alpha of the single window-wide glass sheet.
 pub fn backdrop_alpha() -> u8 {
+    let override_pct = OPACITY.load(Ordering::Relaxed);
+    if override_pct > 0 {
+        return ((override_pct as u16 * 255) / 100) as u8;
+    }
     match surface() {
-        Surface::Blurred => 168,
-        Surface::Solid => 238,
+        Surface::Blurred => 140,
+        Surface::Solid => 210,
     }
 }
 
 /// Alpha of surfaces that float above it: dialogs, popups, the splash card.
+/// Always denser than the backdrop — they sit on top of it and need to read
+/// as a separate layer.
 pub fn floating_alpha() -> u8 {
-    match surface() {
-        Surface::Blurred => 214,
-        Surface::Solid => 246,
-    }
+    backdrop_alpha().saturating_add(34)
+}
+
+/// Fill of the terminal island. Opaque, as the blueprint requires.
+pub fn island_fill() -> Color32 {
+    TERMINAL_BG
+}
+
+/// The island's outline, the one piece of structure in an otherwise flat UI.
+pub fn island_stroke() -> Stroke {
+    Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14))
 }
 
 // ---------------------------------------------------------------------------
@@ -188,131 +213,31 @@ pub fn install(ctx: &egui::Context) {
 
 /// Paints the one glass sheet the whole window sits on.
 ///
-/// Everything except the terminal shares this single surface: the title bar,
-/// the ribbon, both sidebars and the gutters between them are all the same
-/// pane of glass, divided by hairlines rather than by gaps.
+/// Deliberately flat and untinted: a single low-opacity neutral wash with a
+/// hairline edge, the way JetBrains' newer UI treats its window background.
+/// Everything except the terminal island shares it — title bar, ribbon, both
+/// sidebars, the status bar and the space between them.
 pub fn window_backdrop(painter: &egui::Painter, rect: Rect) {
     let cr = CornerRadius::same(WINDOW_RADIUS);
     painter.rect_filled(rect, cr, glass(backdrop_alpha()));
-
-    // A single soft highlight running down from the top edge, so the sheet
-    // reads as glass rather than as flat paint.
-    let bands = 26;
-    let height = (rect.height() * 0.28).min(180.0);
-    for i in 0..bands {
-        let t0 = i as f32 / bands as f32;
-        let t1 = (i + 1) as f32 / bands as f32;
-        let falloff = (1.0 - t0).powf(2.2);
-        let a = falloff * sheen_strength();
-        if a < 0.6 {
-            continue;
-        }
-        let band = Rect::from_min_max(
-            Pos2::new(rect.min.x, rect.min.y + height * t0),
-            Pos2::new(rect.max.x, rect.min.y + height * t1),
-        );
-        let mix = falloff * 0.7;
-        let color = Color32::from_rgba_unmultiplied(
-            lerp_u8(0xFF, ACCENT.r(), mix),
-            lerp_u8(0xFF, ACCENT.g(), mix),
-            lerp_u8(0xFF, ACCENT.b(), mix),
-            a as u8,
-        );
-        let corner = if i == 0 {
-            CornerRadius { nw: WINDOW_RADIUS, ne: WINDOW_RADIUS, sw: 0, se: 0 }
-        } else {
-            CornerRadius::ZERO
-        };
-        painter.rect_filled(band, corner, color);
-    }
-
-    painter.rect_stroke(
-        rect,
-        cr,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x22)),
-        egui::StrokeKind::Inside,
-    );
-}
-
-/// With real blur behind the window the painted sheen is redundant, so it is
-/// dialled back; without blur it does the work on its own.
-fn sheen_strength() -> f32 {
-    match surface() {
-        Surface::Blurred => 14.0,
-        Surface::Solid => 24.0,
-    }
-}
-
-/// Paints a floating frosted surface: dialogs, popups, the splash card.
-pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8, tint: Color32) {
-    let cr = CornerRadius::same(radius);
-    painter.rect_filled(rect, cr, glass(alpha));
-
-    let bands = 24;
-    for i in 0..bands {
-        let t0 = i as f32 / bands as f32;
-        let t1 = (i + 1) as f32 / bands as f32;
-        let falloff = (1.0 - t0).powf(2.4);
-        let a = falloff * 26.0;
-        if a < 0.6 {
-            continue;
-        }
-        let band = Rect::from_min_max(
-            Pos2::new(rect.min.x, rect.min.y + rect.height() * t0),
-            Pos2::new(rect.max.x, rect.min.y + rect.height() * t1),
-        );
-        let mix = falloff * 0.75;
-        let color = Color32::from_rgba_unmultiplied(
-            lerp_u8(0xFF, tint.r(), mix),
-            lerp_u8(0xFF, tint.g(), mix),
-            lerp_u8(0xFF, tint.b(), mix),
-            a as u8,
-        );
-        let corner = if i == 0 {
-            CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 }
-        } else {
-            CornerRadius::ZERO
-        };
-        painter.rect_filled(band, corner, color);
-    }
-
     painter.rect_stroke(
         rect,
         cr,
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x1E)),
         egui::StrokeKind::Inside,
     );
-    painter.line_segment(
-        [
-            Pos2::new(rect.min.x + radius as f32, rect.min.y + 0.5),
-            Pos2::new(rect.max.x - radius as f32, rect.min.y + 0.5),
-        ],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x2E)),
-    );
 }
 
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
-}
-
-/// The hairline that divides one region of the glass from the next.
-pub fn divider_color() -> Color32 {
-    Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x1A)
-}
-
-/// A vertical divider between two panels.
-pub fn divider_v(painter: &egui::Painter, x: f32, y0: f32, y1: f32) {
-    painter.line_segment(
-        [Pos2::new(x, y0), Pos2::new(x, y1)],
-        Stroke::new(1.0, divider_color()),
-    );
-}
-
-/// A horizontal divider between two panels.
-pub fn divider_h(painter: &egui::Painter, y: f32, x0: f32, x1: f32) {
-    painter.line_segment(
-        [Pos2::new(x0, y), Pos2::new(x1, y)],
-        Stroke::new(1.0, divider_color()),
+/// Paints a floating surface: dialogs, popups, the splash card. Flat, like
+/// the backdrop, but denser so it separates from what is behind it.
+pub fn frost(painter: &egui::Painter, rect: Rect, radius: u8, alpha: u8) {
+    let cr = CornerRadius::same(radius);
+    painter.rect_filled(rect, cr, glass(alpha));
+    painter.rect_stroke(
+        rect,
+        cr,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x24)),
+        egui::StrokeKind::Inside,
     );
 }
 

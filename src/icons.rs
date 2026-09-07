@@ -284,3 +284,144 @@ pub fn app_mark(painter: &Painter, rect: Rect) {
         (rect.width() * 0.085).max(1.2),
     );
 }
+
+/// An eye with a stroke through it — the censor toggle.
+pub fn eye_off(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    // The eye outline, drawn as two arcs meeting at the corners.
+    let (left, right) = (p(r, 0.12, 0.5), p(r, 0.88, 0.5));
+    for dir in [-1.0_f32, 1.0] {
+        let mut pts = Vec::new();
+        for i in 0..=14 {
+            let t = i as f32 / 14.0;
+            let x = left.x + (right.x - left.x) * t;
+            let y = left.y + dir * (t * std::f32::consts::PI).sin() * r.height() * 0.26;
+            pts.push(egui::Pos2::new(x, y));
+        }
+        line(painter, pts, c, w);
+    }
+    painter.circle_stroke(p(r, 0.5, 0.5), r.width() * 0.13, Stroke::new(w, c));
+    line(painter, vec![p(r, 0.18, 0.84), p(r, 0.82, 0.16)], c, w * 1.1);
+}
+
+/// Renders the application icon as RGBA pixels, so no binary asset is needed.
+///
+/// Monochrome by design: a grey rounded tile with a light rim and a white
+/// `>_` prompt, which sits quietly in a task bar next to anything else.
+pub fn app_icon_rgba(size: u32) -> Vec<u8> {
+    let s = size as f32;
+    let radius = s * 0.24;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+
+    /// One stroke of the icon glyph: two endpoints and a half-width, all in
+    /// unit space so the icon can be rendered at any size.
+    struct Stroke {
+        a: (f32, f32),
+        b: (f32, f32),
+        half_width: f32,
+    }
+
+    // The `>` chevron and the `_` bar.
+    let strokes = [
+        Stroke { a: (0.30, 0.32), b: (0.48, 0.50), half_width: 0.055 },
+        Stroke { a: (0.48, 0.50), b: (0.30, 0.68), half_width: 0.055 },
+        Stroke { a: (0.56, 0.70), b: (0.74, 0.70), half_width: 0.055 },
+    ];
+
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+
+            // Rounded-rectangle coverage.
+            let dx = (px - s / 2.0).abs() - (s / 2.0 - radius);
+            let dy = (py - s / 2.0).abs() - (s / 2.0 - radius);
+            let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt()
+                + dx.max(dy).min(0.0)
+                - radius;
+            let tile = (0.5 - outside).clamp(0.0, 1.0);
+            if tile <= 0.0 {
+                continue;
+            }
+
+            // Vertical grey gradient, lighter at the top.
+            let t = py / s;
+            let shade = icon_lerp(0x2A as f32, 0x14 as f32, t);
+            let mut base = [shade, shade + 1.0, shade + 6.0];
+
+            // A light rim just inside the edge, to lift it off dark panels.
+            let rim = ((outside + 2.0) / 2.0).clamp(0.0, 1.0) * tile;
+            for c in &mut base {
+                *c = icon_lerp(*c, 0x8A as f32, rim * 0.55);
+            }
+
+            // Glyph coverage.
+            let mut glyph = 0.0f32;
+            for stroke in &strokes {
+                let d = dist_to_segment(px / s, py / s, stroke.a, stroke.b);
+                glyph = glyph.max(((stroke.half_width - d) / (1.5 / s)).clamp(0.0, 1.0));
+            }
+
+            let color = [
+                icon_lerp(base[0], 0xF2 as f32, glyph),
+                icon_lerp(base[1], 0xF4 as f32, glyph),
+                icon_lerp(base[2], 0xFA as f32, glyph),
+            ];
+
+            let i = ((y * size + x) * 4) as usize;
+            rgba[i] = color[0] as u8;
+            rgba[i + 1] = color[1] as u8;
+            rgba[i + 2] = color[2] as u8;
+            rgba[i + 3] = (tile * 255.0) as u8;
+        }
+    }
+
+    rgba
+}
+
+fn icon_lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn dist_to_segment(px: f32, py: f32, (ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
+    let (vx, vy) = (bx - ax, by - ay);
+    let (wx, wy) = (px - ax, py - ay);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 <= f32::EPSILON {
+        0.0
+    } else {
+        ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (ax + vx * t, ay + vy * t);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_app_icon_is_monochrome() {
+        let size = 64u32;
+        let rgba = app_icon_rgba(size);
+        assert_eq!(rgba.len(), (size * size * 4) as usize);
+
+        let mut opaque = 0usize;
+        let mut brightest = 0u8;
+        for px in rgba.chunks_exact(4) {
+            let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+            if a == 0 {
+                continue;
+            }
+            opaque += 1;
+            // Every visible pixel is a grey: the channels stay within a hair
+            // of each other, so the icon can never drift back to a colour.
+            let spread = r.max(g).max(b) - r.min(g).min(b);
+            assert!(spread <= 12, "coloured pixel {r},{g},{b} (spread {spread})");
+            brightest = brightest.max(r);
+        }
+
+        // The rounded corners are cut away, and the glyph is nearly white.
+        assert!(opaque > 0 && opaque < (size * size) as usize, "{opaque} opaque");
+        assert!(brightest > 0xE0, "the >_ glyph should be near white, got {brightest}");
+    }
+}
