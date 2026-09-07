@@ -1,54 +1,49 @@
-//! Application state and top-level layout.
+//! Application state and layout.
+//!
+//! ACLI is a grid of terminal panes on one sheet of glass. There is no splash
+//! screen and nothing to load, so the first frame draws a live shell.
 
-use crate::store::{self, Connection};
+use crate::layout::{Dir, Nav, Node};
+use crate::platform::kwin_blur::Blur;
 use crate::term::{self, TerminalState, pty::PtySession, suggest::Suggestions};
 use crate::theme;
 use crate::ui::chrome::{self, RibbonContext};
-use crate::ui::dialogs::{ConnectionDialog, DialogOutcome};
-use crate::ui::sidebar_left::{self, BrowserAction};
-use crate::ui::sidebar_right::{self, InfoAction};
-use crate::ui::splash;
-use crate::platform::kwin_blur::Blur;
+use crate::ui::settings::{SettingsOutcome, SettingsWindow};
 use eframe::egui::{self, Color32};
 use raw_window_handle::HasWindowHandle;
 use std::collections::HashMap;
-use std::time::Instant;
 
-const MIN_SIDEBAR: f32 = 210.0;
-const MAX_SIDEBAR: f32 = 460.0;
-/// Padding inside each sidebar, in points.
-const SIDEBAR_MARGIN: egui::Margin = egui::Margin {
-    left: 14,
-    right: 14,
-    top: 10,
-    bottom: 12,
-};
-/// Height of the session tab strip above the terminal.
-const TAB_STRIP_HEIGHT: f32 = 32.0;
-/// Height of the status bar along the bottom of the window.
-const STATUS_BAR_HEIGHT: f32 = 26.0;
+/// Ids for splits, taken from the same counter as session ids so the two can
+/// never collide inside the layout tree.
+static NEXT_SPLIT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 32);
 
-pub struct SsclApp {
-    started: Instant,
-    splash_finished: bool,
+fn next_split_id() -> u64 {
+    NEXT_SPLIT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
-    connections: Vec<Connection>,
-    sessions: Vec<PtySession>,
+pub struct AcliApp {
+    sessions: HashMap<u64, PtySession>,
+    layout: Option<Node>,
     active: Option<u64>,
     term_states: HashMap<u64, TerminalState>,
     suggestions: Suggestions,
 
-    dialog: Option<ConnectionDialog>,
-    left_open: bool,
-    right_open: bool,
-    filter: String,
+    settings: Option<SettingsWindow>,
     font_size: f32,
     toast: Option<Toast>,
-    /// KWin backdrop blur, kept in step with the window size.
+
+    /// Divider currently being dragged, and the rect it lives in.
+    dragging: Option<u64>,
+    /// Pane rectangles from the last frame, for focus navigation.
+    pane_rects: Vec<(u64, egui::Rect)>,
+    content_rect: egui::Rect,
+
     blur: Option<Blur>,
     blur_ready: bool,
-    /// What the terminal reported this frame, shown in the status bar.
-    status: crate::term::TerminalStatus,
+    /// Set once a shell has run, so a start-up failure does not close the app.
+    had_session: bool,
+    startup_error: Option<String>,
 }
 
 struct Toast {
@@ -57,35 +52,125 @@ struct Toast {
     born: f64,
 }
 
-impl SsclApp {
+impl AcliApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
-        let _ = store::ensure_dirs();
         Self {
-            started: Instant::now(),
-            splash_finished: false,
-            connections: store::load_all(),
-            sessions: Vec::new(),
+            sessions: HashMap::new(),
+            layout: None,
             active: None,
             term_states: HashMap::new(),
             suggestions: Suggestions::new(),
-            dialog: None,
-            left_open: true,
-            right_open: true,
-            filter: String::new(),
+            settings: None,
             font_size: 13.5,
             toast: None,
+            dragging: None,
+            pane_rects: Vec::new(),
+            content_rect: egui::Rect::NOTHING,
             blur: None,
             blur_ready: false,
-            status: Default::default(),
+            had_session: false,
+            startup_error: None,
         }
     }
 
-    // -- helpers ----------------------------------------------------------
+    // -- panes ------------------------------------------------------------
+
+    fn spawn_session(&mut self, ctx: &egui::Context) -> Option<u64> {
+        match PtySession::local(ctx, 100, 30) {
+            Ok(session) => {
+                let id = session.id;
+                self.sessions.insert(id, session);
+                self.had_session = true;
+                self.startup_error = None;
+                Some(id)
+            }
+            Err(e) => {
+                self.startup_error = Some(e.clone());
+                self.notify(ctx, e, theme::DANGER);
+                None
+            }
+        }
+    }
+
+    fn ensure_first_pane(&mut self, ctx: &egui::Context) {
+        if self.layout.is_some() || self.startup_error.is_some() {
+            return;
+        }
+        if let Some(id) = self.spawn_session(ctx) {
+            self.layout = Some(Node::leaf(id));
+            self.active = Some(id);
+        }
+    }
+
+    fn split(&mut self, ctx: &egui::Context, dir: Dir) {
+        let Some(target) = self.active else { return };
+        let Some(new_id) = self.spawn_session(ctx) else {
+            return;
+        };
+        let split_id = next_split_id();
+        let placed = self
+            .layout
+            .as_mut()
+            .is_some_and(|tree| tree.split(target, dir, split_id, new_id));
+        if placed {
+            self.active = Some(new_id);
+        } else {
+            // Nothing to attach it to; do not leak the shell we just started.
+            self.close_session(new_id);
+        }
+    }
+
+    /// Removes a pane and its shell. Returns true when the pane went away.
+    fn close_pane(&mut self, id: u64) -> bool {
+        let removed = self
+            .layout
+            .as_mut()
+            .is_some_and(|tree| tree.remove(id));
+        if !removed {
+            return false;
+        }
+        self.close_session(id);
+        if self.active == Some(id) {
+            self.active = self.layout.as_ref().and_then(|t| t.leaves().first().copied());
+        }
+        true
+    }
+
+    fn close_session(&mut self, id: u64) {
+        if let Some(mut session) = self.sessions.remove(&id) {
+            session.terminate();
+        }
+        self.term_states.remove(&id);
+    }
+
+    /// Reaps panes whose shell has exited. When the last one goes, so does
+    /// the window — the same as any other terminal.
+    fn reap_dead_panes(&mut self, ctx: &egui::Context) {
+        let dead: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| !s.is_alive())
+            .map(|(id, _)| *id)
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        for id in dead {
+            if !self.close_pane(id) {
+                // The last pane: its shell exited, so the app is done.
+                self.close_session(id);
+                self.layout = None;
+                self.active = None;
+                if self.had_session {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
 
     fn active_session(&self) -> Option<&PtySession> {
-        let id = self.active?;
-        self.sessions.iter().find(|s| s.id == id)
+        self.sessions.get(&self.active?)
     }
 
     fn notify(&mut self, ctx: &egui::Context, text: impl Into<String>, color: Color32) {
@@ -96,130 +181,55 @@ impl SsclApp {
         });
     }
 
-    fn ensure_local_session(&mut self, ctx: &egui::Context) {
-        if !self.sessions.is_empty() {
-            return;
-        }
-        match PtySession::local(ctx, 100, 30) {
-            Ok(session) => {
-                self.active = Some(session.id);
-                self.sessions.push(session);
-            }
-            Err(e) => self.notify(ctx, e, theme::DANGER),
-        }
-    }
-
-    fn open_local(&mut self, ctx: &egui::Context) {
-        match PtySession::local(ctx, 100, 30) {
-            Ok(session) => {
-                self.active = Some(session.id);
-                self.sessions.push(session);
-            }
-            Err(e) => self.notify(ctx, e, theme::DANGER),
-        }
-    }
-
-    fn start_connection(&mut self, ctx: &egui::Context, index: usize) {
-        let Some(conn) = self.connections.get(index).cloned() else {
+    /// Re-sources the generated prompt in every pane that is sitting at an
+    /// empty prompt, so a colour change shows up without opening a new pane.
+    fn reload_prompts(&mut self, ctx: &egui::Context) {
+        let Some(command) = crate::term::pty::reload_prompt_command() else {
+            self.notify(
+                ctx,
+                "This shell has no ACLI prompt to reload.",
+                theme::WARN,
+            );
             return;
         };
-        match PtySession::remote(ctx, &conn, 100, 30) {
-            Ok(session) => {
-                self.notify(
-                    ctx,
-                    format!("Connecting to {}…", conn.target()),
-                    theme::ACCENT_ALT,
-                );
-                // Switch the centre page to the new session, as specified.
-                self.active = Some(session.id);
-                self.sessions.push(session);
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for session in self.sessions.values_mut() {
+            if session.line.at_fresh_prompt() {
+                session.write(command.as_bytes());
+                applied += 1;
+            } else {
+                skipped += 1;
             }
-            Err(e) => self.notify(ctx, e, theme::DANGER),
         }
-    }
-
-    /// Terminates the current session; SSH sessions are then closed and the
-    /// centre page falls back to another open session.
-    fn terminate_active(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.active else { return };
-        let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
-            return;
-        };
-        let remote = self.sessions[pos].kind.is_remote();
-        self.sessions[pos].terminate();
-
-        if remote {
-            self.close_session(ctx, id);
-            self.notify(ctx, "Session terminated.", theme::WARN);
+        let text = if skipped == 0 {
+            format!("Reloaded the prompt in {applied} pane(s).")
         } else {
-            // The local shell is the app's default page: give it a fresh one.
-            self.sessions.remove(pos);
-            self.term_states.remove(&id);
-            self.active = None;
-            self.open_local(ctx);
-            self.notify(ctx, "Local shell restarted.", theme::WARN);
-        }
-    }
-
-    fn close_session(&mut self, ctx: &egui::Context, id: u64) {
-        let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
-            return;
+            format!("Reloaded {applied}; left {skipped} busy pane(s) alone.")
         };
-        self.sessions[pos].terminate();
-        self.sessions.remove(pos);
-        self.term_states.remove(&id);
-        if self.active == Some(id) {
-            self.active = self.sessions.last().map(|s| s.id);
-            if self.sessions.is_empty() {
-                self.open_local(ctx);
-            }
-        }
-    }
-
-    fn reload_connections(&mut self) {
-        self.connections = store::load_all();
+        self.notify(ctx, text, theme::ACCENT_ALT);
     }
 }
 
-impl eframe::App for SsclApp {
+impl eframe::App for AcliApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Fully transparent: the desktop shows through everything but the
-        // terminal sheet, which paints its own opaque background.
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.sync_blur(ctx, frame);
-        let elapsed = self.started.elapsed().as_secs_f32();
-
-        // ---- Splash ------------------------------------------------------
-        if !self.splash_finished {
-            if elapsed < splash::total() {
-                // The real UI fades in underneath the splash card.
-                if elapsed > splash::HOLD {
-                    self.ensure_local_session(ctx);
-                    self.main_ui(ctx);
-                }
-                splash::draw(ctx, elapsed);
-                return;
-            }
-            self.splash_finished = true;
-        }
-
-        self.ensure_local_session(ctx);
+        self.ensure_first_pane(ctx);
         self.shortcuts(ctx);
         self.main_ui(ctx);
+        self.settings_ui(ctx);
         self.toast_ui(ctx);
+        self.reap_dead_panes(ctx);
     }
 }
 
-impl SsclApp {
-    /// Asks KWin to blur what is behind the window, and keeps the blurred
-    /// region matching the window as it is resized.
-    ///
-    /// The glass palette is chosen once, on the first frame: dense when
-    /// nothing is blurring behind us, thin when something is. `SSCL_BLUR`
-    /// (`on`, `off`, or `auto`) overrides the detection.
+impl AcliApp {
+    /// Asks KWin to blur behind the window, and keeps the blurred region
+    /// matching it as it is resized. See `platform::kwin_blur`.
     fn sync_blur(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if !self.blur_ready {
             self.blur_ready = true;
@@ -228,7 +238,7 @@ impl SsclApp {
                 .ok()
                 .and_then(|h| Blur::new(&h.as_raw()));
 
-            let forced = std::env::var("SSCL_BLUR").unwrap_or_default().to_lowercase();
+            let forced = std::env::var("ACLI_BLUR").unwrap_or_default().to_lowercase();
             let blurred = match forced.as_str() {
                 "on" | "1" | "true" => true,
                 "off" | "0" | "false" => false,
@@ -240,7 +250,7 @@ impl SsclApp {
                 theme::Surface::Solid
             });
 
-            if let Some(pct) = std::env::var("SSCL_OPACITY")
+            if let Some(pct) = std::env::var("ACLI_OPACITY")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
                 .filter(|p| (1..=100).contains(p))
@@ -259,36 +269,29 @@ impl SsclApp {
         }
     }
 
-    /// Global keyboard shortcuts. These are consumed here so the terminal
-    /// never sees them.
+    /// Global shortcuts, consumed here so the terminal never sees them.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
         let cs = Modifiers::CTRL | Modifiers::SHIFT;
-
         let hit = |ctx: &egui::Context, mods: Modifiers, key: Key| -> bool {
             ctx.input_mut(|i| i.consume_key(mods, key))
         };
 
-        if hit(ctx, cs, Key::N) && self.dialog.is_none() {
-            self.dialog = Some(ConnectionDialog::new());
+        if hit(ctx, cs, Key::R) {
+            self.split(ctx, Dir::Row);
+        }
+        if hit(ctx, cs, Key::D) {
+            self.split(ctx, Dir::Column);
         }
         if hit(ctx, cs, Key::W) {
-            self.terminate_active(ctx);
+            if let Some(id) = self.active {
+                if !self.close_pane(id) {
+                    self.notify(ctx, "That is the only pane.", theme::WARN);
+                }
+            }
         }
-        if hit(ctx, cs, Key::O) {
-            self.open_connections_folder(ctx);
-        }
-        if hit(ctx, cs, Key::B) {
-            self.left_open = !self.left_open;
-        }
-        if hit(ctx, cs, Key::I) {
-            self.right_open = !self.right_open;
-        }
-        if hit(ctx, cs, Key::T) {
-            self.open_local(ctx);
-        }
-        if hit(ctx, cs, Key::P) {
-            crate::privacy::toggle();
+        if hit(ctx, cs, Key::Comma) && self.settings.is_none() {
+            self.settings = Some(SettingsWindow::new());
         }
         if hit(ctx, Modifiers::CTRL, Key::Plus) || hit(ctx, Modifiers::CTRL, Key::Equals) {
             self.font_size = (self.font_size + 0.5).min(28.0);
@@ -299,378 +302,202 @@ impl SsclApp {
         if hit(ctx, Modifiers::CTRL, Key::Num0) {
             self.font_size = 13.5;
         }
+
+        // Focus movement between panes.
+        for (key, nav) in [
+            (Key::ArrowLeft, Nav::Left),
+            (Key::ArrowRight, Nav::Right),
+            (Key::ArrowUp, Nav::Up),
+            (Key::ArrowDown, Nav::Down),
+        ] {
+            if hit(ctx, cs, key) {
+                self.move_focus(ctx, nav);
+            }
+        }
     }
 
-    fn open_connections_folder(&mut self, ctx: &egui::Context) {
-        let dir = store::connections_dir();
-        match store::open_in_file_browser(&dir) {
-            Ok(()) => self.notify(ctx, format!("Opened {}", dir.display()), theme::ACCENT_ALT),
-            Err(e) => self.notify(ctx, e, theme::DANGER),
+    fn move_focus(&mut self, ctx: &egui::Context, nav: Nav) {
+        let (Some(tree), Some(from)) = (self.layout.as_ref(), self.active) else {
+            return;
+        };
+        if let Some(to) = tree.neighbour(from, nav, self.content_rect, theme::GAP) {
+            self.active = Some(to);
+            // Hand egui's keyboard focus over as well.
+            ctx.memory_mut(|m| m.surrender_focus(m.focused().unwrap_or(egui::Id::NULL)));
         }
     }
 
     fn main_ui(&mut self, ctx: &egui::Context) {
-        // One sheet of glass under everything. The panels below paint no
-        // background of their own, so the chrome reads as a single surface
-        // divided by hairlines rather than as separate floating cards.
-        let screen = ctx.screen_rect();
-        theme::window_backdrop(&ctx.layer_painter(egui::LayerId::background()), screen);
-
+        theme::window_backdrop(&ctx.layer_painter(egui::LayerId::background()), ctx.screen_rect());
         chrome::resize_handles(ctx);
 
-        // ---- Top bar -----------------------------------------------------
-        let (title, subtitle, alive) = match self.active_session() {
-            Some(s) => (s.title.clone(), s.subtitle.clone(), s.is_alive()),
-            None => (String::new(), String::new(), false),
+        let panes = self.layout.as_ref().map(Node::pane_count).unwrap_or(0);
+        let (shell, grid) = match self.active_session() {
+            Some(s) => (s.shell.clone(), Some((s.cols, s.rows))),
+            None => (String::new(), None),
         };
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
         let actions = chrome::top_bar(
             ctx,
             &RibbonContext {
-                session_title: &title,
-                session_subtitle: &subtitle,
-                session_alive: alive,
-                has_session: self.active.is_some(),
-                left_open: self.left_open,
-                right_open: self.right_open,
+                shell: &shell,
+                panes,
+                grid,
+                settings_open: self.settings.is_some(),
                 maximized,
             },
         );
-
-        if actions.new_connection && self.dialog.is_none() {
-            self.dialog = Some(ConnectionDialog::new());
+        if actions.split_right {
+            self.split(ctx, Dir::Row);
         }
-        if actions.terminate {
-            self.terminate_active(ctx);
+        if actions.split_down {
+            self.split(ctx, Dir::Column);
         }
-        if actions.open_folder {
-            self.open_connections_folder(ctx);
+        if actions.close_pane {
+            if let Some(id) = self.active {
+                if !self.close_pane(id) {
+                    self.notify(ctx, "That is the only pane.", theme::WARN);
+                }
+            }
         }
-        if actions.toggle_left {
-            self.left_open = !self.left_open;
-        }
-        if actions.toggle_right {
-            self.right_open = !self.right_open;
-        }
-
-        // ---- Status bar ---------------------------------------------------
-        // Full width, along the bottom, part of the same glass. Everything
-        // that used to float over the terminal lives here instead.
-        egui::TopBottomPanel::bottom("sscl-status")
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 4,
-                bottom: 6,
-            }))
-            .show_separator_line(false)
-            .exact_height(STATUS_BAR_HEIGHT)
-            .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.expand_to_include_rect(rect);
-                self.status_bar(ui);
-            });
-
-        // ---- Left sidebar -------------------------------------------------
-        let mut browser_action = None;
-        if self.left_open {
-            egui::SidePanel::left("sscl-left")
-                .frame(egui::Frame::NONE.inner_margin(SIDEBAR_MARGIN))
-                .resizable(true)
-                .default_width(272.0)
-                .width_range(MIN_SIDEBAR..=MAX_SIDEBAR)
-                .show_separator_line(false)
-                .show(ctx, |ui| {
-                    let rect = ui.max_rect();
-                    // Claim the whole panel: the contents are drawn into a
-                    // child Ui, which would otherwise let the resizable panel
-                    // collapse to its minimum width on the next frame.
-                    ui.expand_to_include_rect(rect);
-
-                    let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
-                    let mut inner = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(content)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-                    inner.set_clip_rect(content);
-                    inner.set_max_width(content.width());
-                    let sessions = &self.sessions;
-                    let running = |conn: &Connection| -> Option<(u64, bool)> {
-                        sessions
-                            .iter()
-                            .find(|s| s.connection().map(|c| c.dir == conn.dir).unwrap_or(false))
-                            .map(|s| (s.id, s.is_alive()))
-                    };
-                    browser_action =
-                        sidebar_left::show(&mut inner, &self.connections, &running, &mut self.filter);
-                });
+        if actions.settings && self.settings.is_none() {
+            self.settings = Some(SettingsWindow::new());
         }
 
-        // ---- Right sidebar ------------------------------------------------
-        let mut info_action = None;
-        if self.right_open {
-            egui::SidePanel::right("sscl-right")
-                .frame(egui::Frame::NONE.inner_margin(SIDEBAR_MARGIN))
-                .resizable(true)
-                .default_width(308.0)
-                .width_range(MIN_SIDEBAR..=MAX_SIDEBAR)
-                .show_separator_line(false)
-                .show(ctx, |ui| {
-                    let rect = ui.max_rect();
-                    ui.expand_to_include_rect(rect);
-
-                    let content = rect.shrink2(egui::Vec2::new(2.0, 6.0));
-                    let mut inner = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(content)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-                    inner.set_clip_rect(content);
-                    inner.set_max_width(content.width());
-                    info_action = sidebar_right::show(&mut inner, self.active_session());
-                });
-        }
-
-        // ---- Centre page --------------------------------------------------
-        // The terminal is an island: opaque, rounded, and inset from the
-        // chrome on every side so the glass shows around it.
-        let dialog_open = self.dialog.is_some();
-        let mut tab_result = None;
-        let mut status = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: theme::GAP as i8,
+                right: theme::GAP as i8,
+                top: theme::GAP as i8,
+                bottom: theme::GAP as i8,
+            }))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 ui.expand_to_include_rect(rect);
+                self.content_rect = rect;
 
-                let mut top = rect.min.y;
-                if self.sessions.len() > 1 || self.sessions.iter().any(|s| s.kind.is_remote()) {
-                    let strip = egui::Rect::from_min_max(
-                        egui::Pos2::new(rect.min.x + theme::GAP, rect.min.y),
-                        egui::Pos2::new(rect.max.x - theme::GAP, rect.min.y + TAB_STRIP_HEIGHT),
-                    );
-                    let mut strip_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(strip.shrink2(egui::Vec2::new(0.0, 3.0)))
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    );
-                    strip_ui.set_clip_rect(strip);
-                    let tabs: Vec<(u64, String, bool, bool)> = self
-                        .sessions
-                        .iter()
-                        .map(|s| (s.id, s.title.clone(), s.is_alive(), s.kind.is_remote()))
-                        .collect();
-                    tab_result = Some(chrome::tab_strip(&mut strip_ui, &tabs, self.active));
-                    top = strip.max.y;
-                }
+                let Some(tree) = self.layout.clone() else {
+                    self.no_panes_ui(ui, rect);
+                    return;
+                };
 
-                let island = egui::Rect::from_min_max(
-                    egui::Pos2::new(rect.min.x + theme::GAP, top + theme::GAP),
-                    egui::Pos2::new(rect.max.x - theme::GAP, rect.max.y),
-                );
+                self.pane_rects = tree.pane_rects(rect, theme::GAP);
+                self.dividers_ui(ui, &tree, rect);
 
-                let id = self.active;
-                let font_size = self.font_size;
-                if let Some(id) = id {
+                let (font_size, active) = (self.font_size, self.active);
+                let mut focus_changed = None;
+                for (id, pane_rect) in self.pane_rects.clone() {
                     let state = self.term_states.entry(id).or_default();
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                        let mut term_ui = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(island)
-                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                        );
-                        term_ui.set_clip_rect(island);
-                        status = Some(term::show(
-                            &mut term_ui,
-                            session,
-                            &mut self.suggestions,
-                            state,
-                            font_size,
-                            !dialog_open,
-                        ));
+                    let Some(session) = self.sessions.get_mut(&id) else {
+                        continue;
+                    };
+                    let mut pane_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(pane_rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+                    pane_ui.set_clip_rect(pane_rect);
+                    let status = term::show(
+                        &mut pane_ui,
+                        session,
+                        &mut self.suggestions,
+                        state,
+                        font_size,
+                        active == Some(id),
+                    );
+                    if status.focused && active != Some(id) {
+                        focus_changed = Some(id);
                     }
                 }
+                if let Some(id) = focus_changed {
+                    self.active = Some(id);
+                }
             });
-        if let Some(status) = status {
-            self.status = status;
-        }
+    }
 
-        // ---- Act on what the panels reported ------------------------------
-        if let Some(result) = tab_result {
-            if let Some(id) = result.activate {
-                self.active = Some(id);
+    /// Draggable strips in the gaps between panes.
+    fn dividers_ui(&mut self, ui: &mut egui::Ui, tree: &Node, rect: egui::Rect) {
+        for (split_id, dir, strip) in tree.divider_rects(rect, theme::GAP) {
+            // Widen the grab area a little beyond the visible gap.
+            let grab = match dir {
+                Dir::Row => strip.expand2(egui::vec2(2.0, 0.0)),
+                Dir::Column => strip.expand2(egui::vec2(0.0, 2.0)),
+            };
+            let response = ui.interact(
+                grab,
+                ui.id().with(("acli-divider", split_id)),
+                egui::Sense::drag(),
+            );
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(match dir {
+                    Dir::Row => egui::CursorIcon::ResizeHorizontal,
+                    Dir::Column => egui::CursorIcon::ResizeVertical,
+                });
             }
-            if let Some(id) = result.close {
-                self.close_session(ctx, id);
+            if response.drag_started() {
+                self.dragging = Some(split_id);
             }
-        }
-
-        match browser_action {
-            Some(BrowserAction::Start(i)) => self.start_connection(ctx, i),
-            Some(BrowserAction::Edit(i)) => {
-                if let Some(conn) = self.connections.get(i) {
-                    self.dialog = Some(ConnectionDialog::edit(conn));
-                }
-            }
-            Some(BrowserAction::Focus(id)) => self.active = Some(id),
-            Some(BrowserAction::New) => {
-                if self.dialog.is_none() {
-                    self.dialog = Some(ConnectionDialog::new());
-                }
-            }
-            None => {}
-        }
-
-        match info_action {
-            Some(InfoAction::Rescan) => {
-                if let Some(conn) = self.active_session().and_then(|s| s.connection()) {
-                    let (host, port) = (conn.host.clone(), conn.port);
-                    if let Some(handle) = self.active_session().map(|s| s.probe.clone()) {
-                        if let Ok(mut state) = handle.state.lock() {
-                            *state = crate::sshinfo::ProbeState::Idle;
-                        }
-                        crate::sshinfo::spawn(handle, host, port);
+            if response.dragged() && self.dragging == Some(split_id) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    // Work the ratio out against the branch's own area, which
+                    // is the union of its two children plus the gap.
+                    let ratio = match dir {
+                        Dir::Row => (pos.x - rect.min.x) / (rect.width() - theme::GAP).max(1.0),
+                        Dir::Column => (pos.y - rect.min.y) / (rect.height() - theme::GAP).max(1.0),
+                    };
+                    if let Some(tree) = self.layout.as_mut() {
+                        tree.set_ratio(split_id, ratio);
                     }
                 }
             }
-            Some(InfoAction::Copy(text)) => {
-                ctx.copy_text(text);
-                self.notify(ctx, "Copied to clipboard.", theme::ACCENT_ALT);
+            if response.drag_stopped() {
+                self.dragging = None;
             }
-            None => {}
+
+            // A faint grip so the divider is discoverable.
+            if response.hovered() || response.dragged() {
+                let mid = strip.center();
+                let along = match dir {
+                    Dir::Row => egui::vec2(0.0, 10.0),
+                    Dir::Column => egui::vec2(10.0, 0.0),
+                };
+                ui.painter().line_segment(
+                    [mid - along, mid + along],
+                    egui::Stroke::new(2.0, theme::ACCENT_ALT.gamma_multiply(0.8)),
+                );
+            }
         }
-
-        self.dialog_ui(ctx);
     }
 
-    /// The bottom status bar: what session is on screen, and whatever the
-    /// terminal wants to say.
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
-        let mono = egui::FontId::new(10.5, egui::FontFamily::Monospace);
-
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-
-            if let Some(session) = self.active_session() {
-                let (icon, tint): (crate::icons::Icon, Color32) = if session.kind.is_remote() {
-                    (crate::icons::server, theme::ACCENT_ALT)
-                } else {
-                    (crate::icons::terminal, theme::TEXT_DIM)
-                };
-                let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
-                icon(ui.painter(), r, tint, 1.3);
-                ui.label(
-                    egui::RichText::new(&session.title)
-                        .font(font.clone())
-                        .color(theme::TEXT_DIM),
-                );
-                if !session.subtitle.is_empty() {
-                    ui.label(
-                        egui::RichText::new(crate::privacy::mask(&session.subtitle))
-                            .font(mono.clone())
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-            }
-            if self.status.cols > 0 {
-                ui.label(
-                    egui::RichText::new(format!("{}×{}", self.status.cols, self.status.rows))
-                        .font(mono.clone())
-                        .color(theme::TEXT_FAINT),
-                );
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-
-                let suggestions = if self.suggestions.is_scanning() {
-                    "indexing $PATH…".to_string()
-                } else {
-                    format!(
-                        "{} cmds · {} history",
-                        self.suggestions.command_count(),
-                        self.suggestions.history_count()
-                    )
-                };
-                ui.label(
-                    egui::RichText::new(suggestions)
-                        .font(font.clone())
-                        .color(theme::TEXT_FAINT),
-                );
-
-                if let Some(note) = self.status.exit_note.clone() {
-                    ui.label(
-                        egui::RichText::new(note)
-                            .font(font.clone())
-                            .color(theme::DANGER),
-                    );
-                } else if self.status.scrollback > 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "scrollback −{}  ·  End to follow",
-                            self.status.scrollback
-                        ))
-                        .font(font.clone())
-                        .color(theme::WARN),
-                    );
-                } else if self.status.copied {
-                    ui.label(
-                        egui::RichText::new("copied")
-                            .font(font.clone())
-                            .color(theme::ACCENT_ALT),
-                    );
-                    ui.ctx().request_repaint();
-                } else if !self.status.focused && self.active.is_some() {
-                    ui.label(
-                        egui::RichText::new("click the terminal to type")
-                            .font(font.clone())
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-            });
-        });
+    fn no_panes_ui(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(theme::ISLAND_RADIUS),
+            theme::island_fill(),
+        );
+        let text = self
+            .startup_error
+            .clone()
+            .unwrap_or_else(|| "No shell is running.".to_string());
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::new(12.5, egui::FontFamily::Proportional),
+            theme::DANGER,
+        );
     }
 
-    fn dialog_ui(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.dialog.as_mut() else {
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.settings.as_mut() else {
             return;
         };
-        match dialog.show(ctx) {
-            DialogOutcome::Pending => {}
-            DialogOutcome::Closed => self.dialog = None,
-            DialogOutcome::Create(request) => match store::create(&request) {
-                Ok(conn) => {
-                    let name = conn.name.clone();
-                    self.dialog = None;
-                    self.reload_connections();
-                    self.notify(ctx, format!("Saved \"{name}\"."), theme::ACCENT_ALT);
-                }
-                Err(e) => dialog.error = Some(e),
-            },
-            DialogOutcome::Update {
-                original,
-                request,
-                new_key,
-            } => match store::update(&original, &request, new_key.as_deref()) {
-                Ok(conn) => {
-                    let name = conn.name.clone();
-                    self.dialog = None;
-                    self.reload_connections();
-                    self.notify(ctx, format!("Updated \"{name}\"."), theme::ACCENT_ALT);
-                }
-                Err(e) => dialog.error = Some(e),
-            },
-            DialogOutcome::Delete(conn) => match store::delete(&conn) {
-                Ok(()) => {
-                    let name = conn.name.clone();
-                    self.dialog = None;
-                    self.reload_connections();
-                    self.notify(ctx, format!("Deleted \"{name}\"."), theme::WARN);
-                }
-                Err(e) => dialog.error = Some(e),
-            },
+        match window.show(ctx) {
+            SettingsOutcome::Pending => {}
+            SettingsOutcome::Closed => self.settings = None,
+            SettingsOutcome::ApplyToOpenPanes => self.reload_prompts(ctx),
         }
     }
 
@@ -688,9 +515,9 @@ impl SsclApp {
             1.0
         };
         let screen = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("sscl-toast"))
+        egui::Area::new(egui::Id::new("acli-toast"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(egui::Pos2::new(screen.center().x, screen.max.y - 74.0))
+            .fixed_pos(egui::Pos2::new(screen.center().x, screen.max.y - 56.0))
             .pivot(egui::Align2::CENTER_CENTER)
             .interactable(false)
             .show(ctx, |ui| {

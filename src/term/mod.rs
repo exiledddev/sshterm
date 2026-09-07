@@ -89,10 +89,10 @@ pub fn show(
     suggestions: &mut Suggestions,
     state: &mut TerminalState,
     font_size: f32,
-    enabled: bool,
+    is_active: bool,
 ) -> TerminalStatus {
     let rect = ui.max_rect();
-    let id = ui.make_persistent_id(("sscl-terminal", session.id));
+    let id = ui.make_persistent_id(("acli-terminal", session.id));
     let response = ui.interact(rect, id, Sense::click_and_drag());
 
     // The terminal must receive Tab, arrows and Escape itself.
@@ -107,17 +107,33 @@ pub fn show(
             },
         );
     });
-    if enabled && (response.clicked() || response.drag_started()) {
+    // Any pane can be clicked into; that is how focus moves between them.
+    if response.clicked() || response.drag_started() {
         response.request_focus();
     }
-    let focused = enabled && response.has_focus();
+    // The pane the application considers active takes the keyboard as soon
+    // as nothing else holds it — on the first frame, and after a pane closes.
+    if is_active && ui.memory(|m| m.focused().is_none()) {
+        response.request_focus();
+    }
+    let focused = response.has_focus();
 
-    // The opaque dark-grey island the blueprint requires, inset from the
-    // surrounding glass and outlined, like an editor pane.
+    // The opaque island, inset from the surrounding glass and outlined like
+    // an editor pane. The focused one wears a brighter ring, which is the
+    // only way to tell panes apart once the window is split.
     let painter = ui.painter_at(rect);
     let island = CornerRadius::same(theme::ISLAND_RADIUS);
     painter.rect_filled(rect, island, theme::island_fill());
-    painter.rect_stroke(rect, island, theme::island_stroke(), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        island,
+        if focused {
+            Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.85))
+        } else {
+            theme::island_stroke()
+        },
+        egui::StrokeKind::Inside,
+    );
 
     let m = metrics(ui.ctx(), font_size);
     let grid_origin = rect.min + Vec2::splat(PAD);
@@ -174,9 +190,7 @@ pub fn show(
     if focused {
         handle_keyboard(ui, session, suggestions, state, &screen_info);
     }
-    if enabled {
-        handle_mouse(ui, &response, session, state, &m, grid_origin, &screen_info, cols, rows);
-    }
+    handle_mouse(ui, &response, session, state, &m, grid_origin, &screen_info, cols, rows);
 
     if focused && !screen_info.hide_cursor {
         ui.ctx()

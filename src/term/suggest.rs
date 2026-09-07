@@ -1,6 +1,6 @@
 //! Fish-style command autosuggestions for the terminal page.
 //!
-//! The shell inside the PTY does its own line editing, so SSCL mirrors the
+//! The shell inside the PTY does its own line editing, so ACLI mirrors the
 //! keystrokes it forwards in order to know what the current line looks like.
 //! Whenever an operation cannot be modelled faithfully (tab completion,
 //! history search, arrow-key history) the mirror marks itself out of sync and
@@ -158,6 +158,12 @@ impl LineTracker {
         self.selected = 0;
     }
 
+    /// True when the shell is sitting at an empty prompt we are in step
+    /// with — the only moment it is safe to type a command into it.
+    pub fn at_fresh_prompt(&self) -> bool {
+        self.in_sync && self.chars.is_empty()
+    }
+
     /// The shell changed the line in a way we cannot follow.
     pub fn desync(&mut self) {
         self.chars.clear();
@@ -185,7 +191,7 @@ impl Default for Suggestions {
 
 impl Suggestions {
     pub fn new() -> Self {
-        let history_path = crate::store::app_dir().join("history");
+        let history_path = crate::paths::history_file();
         let mut history = read_lines(&history_path, 5_000);
         if history.is_empty() {
             // Seed from the user's own shell history so suggestions are
@@ -528,7 +534,7 @@ mod tests {
 
     #[test]
     fn parses_extended_zsh_history() {
-        let dir = std::env::temp_dir().join(format!("sscl-zsh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("acli-zsh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".zsh_history");
         std::fs::write(

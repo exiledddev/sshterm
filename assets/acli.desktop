@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ACLI
+GenericName=Terminal
+Comment=Amplified Command Line Interface — a splitting terminal
+Exec=acli
+Icon=acli
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;shell;console;command;split;
+StartupNotify=true
+StartupWMClass=acli

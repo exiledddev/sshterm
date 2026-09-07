@@ -1,8 +1,5 @@
-//! All of the SSCL user interface.
+//! All of the ACLI user interface.
 
 pub mod chrome;
-pub mod dialogs;
-pub mod sidebar_left;
-pub mod sidebar_right;
-pub mod splash;
+pub mod settings;
 pub mod widgets;

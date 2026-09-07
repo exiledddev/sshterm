@@ -5,8 +5,7 @@
 //! Linux terminal emulator. Output is fed into a `vt100::Parser` on a reader
 //! thread; the UI thread only ever reads the parsed screen.
 
-use crate::sshinfo::{self, ProbeHandle};
-use crate::store::Connection;
+use crate::prompt::{PromptTheme, Shell};
 use crate::term::suggest::LineTracker;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -16,34 +15,16 @@ use std::sync::{Arc, Mutex};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// What a session is attached to.
-#[derive(Debug, Clone)]
-pub enum SessionKind {
-    /// The local login shell, so the app is a usable terminal on its own.
-    Local,
-    /// `ssh` to a saved connection.
-    Remote(Box<Connection>),
-}
-
-impl SessionKind {
-    pub fn is_remote(&self) -> bool {
-        matches!(self, SessionKind::Remote(_))
-    }
-}
-
 /// A live terminal session.
 pub struct PtySession {
     pub id: u64,
-    pub title: String,
-    pub subtitle: String,
-    pub kind: SessionKind,
+    /// Name of the program the pane is running, e.g. `bash`.
+    pub shell: String,
     pub parser: Arc<Mutex<vt100::Parser>>,
     /// False once the child process has exited.
     pub alive: Arc<AtomicBool>,
     /// Exit description, set when the child goes away.
     pub exit_note: Arc<Mutex<Option<String>>>,
-    /// SSH fingerprinting results for the right sidebar.
-    pub probe: Arc<ProbeHandle>,
     /// Tracks the line being typed, for fish-style suggestions.
     pub line: LineTracker,
     /// Current scrollback offset in rows (0 = following the live output).
@@ -76,59 +57,19 @@ impl PtySession {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| program.clone());
-        Self::spawn(
-            ctx,
-            cmd,
-            SessionKind::Local,
-            "Local shell".to_string(),
-            shell_name,
-            cols,
-            rows,
-        )
-    }
-
-    /// Opens an ssh session for a saved connection and starts fingerprinting
-    /// the server in the background.
-    pub fn remote(
-        ctx: &eframe::egui::Context,
-        conn: &Connection,
-        cols: u16,
-        rows: u16,
-    ) -> Result<Self, String> {
-        let argv = conn.ssh_argv();
-        let mut cmd = CommandBuilder::new(&argv[0]);
-        for a in &argv[1..] {
-            cmd.arg(a);
-        }
-        cmd.env("TERM", "xterm-256color");
-        if let Some(home) = dirs::home_dir() {
-            cmd.cwd(home);
-        }
-        let session = Self::spawn(
-            ctx,
-            cmd,
-            SessionKind::Remote(Box::new(conn.clone())),
-            conn.name.clone(),
-            conn.target(),
-            cols,
-            rows,
-        )?;
-        sshinfo::spawn(session.probe.clone(), conn.host.clone(), conn.port);
-        Ok(session)
+        Self::spawn(ctx, cmd, shell_name, cols, rows)
     }
 
     fn spawn(
         ctx: &eframe::egui::Context,
         mut cmd: CommandBuilder,
-        kind: SessionKind,
-        title: String,
-        subtitle: String,
+        shell_name: String,
         cols: u16,
         rows: u16,
     ) -> Result<Self, String> {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("SSCL_SESSION", "1");
+        cmd.env("ACLI_SESSION", "1");
 
         let pty = native_pty_system();
         let pair = pty
@@ -209,18 +150,15 @@ impl PtySession {
 
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            title,
-            subtitle,
-            kind,
+            shell: shell_name,
             parser,
             alive,
             exit_note,
-            probe: ProbeHandle::new(),
             line: LineTracker::default(),
             scroll: 0,
             cols,
             rows,
-            started: crate::store::timestamp(),
+            started: crate::paths::timestamp(),
             writer: Some(writer),
             master,
             killer,
@@ -297,13 +235,6 @@ impl PtySession {
         self.writer = None;
     }
 
-    /// The remote connection behind this session, if any.
-    pub fn connection(&self) -> Option<&Connection> {
-        match &self.kind {
-            SessionKind::Remote(c) => Some(c),
-            SessionKind::Local => None,
-        }
-    }
 }
 
 impl Drop for PtySession {
@@ -316,139 +247,65 @@ impl Drop for PtySession {
 // Login shell + generated prompt
 // ---------------------------------------------------------------------------
 
-/// Chooses the program, arguments and environment used for a local shell,
-/// wiring in the generated SSCL prompt where the shell supports it.
+/// Chooses the program, arguments and environment for a local shell, wiring
+/// in the generated ACLI prompt where the shell supports one.
+///
+/// The rc file is rewritten on every launch, so a colour changed in Settings
+/// takes effect in the next pane you open.
 fn login_shell_command() -> (String, Vec<String>, Vec<(String, String)>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let name = PathBuf::from(&shell)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let path = PathBuf::from(&shell);
+    let (theme, _) = PromptTheme::load();
 
-    match name.as_str() {
-        "bash" => match write_prompt_file("sscl.bashrc", BASH_PROMPT) {
-            Ok(path) => (
-                shell,
-                vec![
-                    "--rcfile".into(),
-                    path.to_string_lossy().into_owned(),
-                    "-i".into(),
-                ],
-                vec![],
-            ),
-            Err(_) => (shell, vec!["-i".into()], vec![]),
-        },
-        "zsh" => match write_zdotdir() {
+    let plain = (shell.clone(), vec!["-i".to_string()], Vec::new());
+    let Some(kind) = Shell::from_path(&path) else {
+        return plain;
+    };
+    let Ok(rc) = theme.write_rc(kind) else {
+        return plain;
+    };
+
+    match kind {
+        Shell::Bash => (
+            shell,
+            vec!["--rcfile".into(), rc.to_string_lossy().into_owned(), "-i".into()],
+            Vec::new(),
+        ),
+        // zsh only reads a directory, so the generated file is placed in one
+        // of its own and ZDOTDIR points at it. The user's ~/.zshrc is sourced
+        // from inside it, so nothing of theirs is bypassed.
+        Shell::Zsh => match install_zdotdir(&rc) {
             Ok(dir) => (
                 shell,
                 vec!["-i".into()],
                 vec![("ZDOTDIR".into(), dir.to_string_lossy().into_owned())],
             ),
-            Err(_) => (shell, vec!["-i".into()], vec![]),
+            Err(_) => plain,
         },
-        "fish" => match write_prompt_file("sscl.fish", FISH_PROMPT) {
-            Ok(path) => (
-                shell,
-                vec!["-C".into(), format!("source {}", path.display())],
-                vec![],
-            ),
-            Err(_) => (shell, vec![], vec![]),
-        },
-        _ => (shell, vec!["-i".into()], vec![]),
+        Shell::Fish => (
+            shell,
+            vec!["-C".into(), format!("source {}", rc.display())],
+            Vec::new(),
+        ),
     }
 }
 
-fn write_prompt_file(name: &str, contents: &str) -> std::io::Result<PathBuf> {
-    let dir = crate::store::app_dir();
+/// Copies the generated zsh prompt into a ZDOTDIR as `.zshrc`.
+fn install_zdotdir(rc: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = crate::paths::data_dir().join("zdotdir");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(name);
-    std::fs::write(&path, contents)?;
-    Ok(path)
-}
-
-fn write_zdotdir() -> std::io::Result<PathBuf> {
-    let dir = crate::store::app_dir().join("zdotdir");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(".zshrc"), ZSH_PROMPT)?;
+    std::fs::copy(rc, dir.join(".zshrc"))?;
     Ok(dir)
 }
 
-/// Generated bash rc: sources the user's own configuration first, then
-/// installs the two-line SSCL prompt.
-const BASH_PROMPT: &str = r##"# Generated by SSCL (Secure Shell Command Line). Safe to delete.
-[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
-[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-
-__sscl_git() {
-  local b
-  b=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null) || return
-  local dirty=""
-  [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty="*"
-  printf ' \001\033[38;5;60m\002─\001\033[0m\002 \001\033[38;5;215m\002%s%s\001\033[0m\002' "$b" "$dirty"
+/// Re-sources the generated prompt in a shell that is sitting at a fresh
+/// prompt, so a colour change can be seen without opening a new pane.
+pub fn reload_prompt_command() -> Option<String> {
+    let shell = std::env::var("SHELL").ok()?;
+    let kind = Shell::from_path(&PathBuf::from(&shell))?;
+    let rc = crate::paths::data_dir().join(kind.rc_name());
+    match kind {
+        Shell::Bash | Shell::Zsh => Some(format!("source {}\n", rc.display())),
+        Shell::Fish => Some(format!("source {}\n", rc.display())),
+    }
 }
-
-__sscl_ps1() {
-  local ec=$?
-  local dot arrow code=""
-  if [ $ec -eq 0 ]; then dot='\[\e[38;5;84m\]●'; arrow='\[\e[1;38;5;141m\]❯'
-  else dot='\[\e[38;5;203m\]●'; arrow='\[\e[1;38;5;203m\]❯'; code=" \[\e[38;5;203m\][$ec]"; fi
-  PS1="\[\e[38;5;60m\]╭─\[\e[0m\] ${dot} \[\e[38;5;141m\]\u\[\e[38;5;60m\]@\[\e[38;5;86m\]\h\[\e[0m\] \[\e[38;5;60m\]─\[\e[0m\] \[\e[38;5;110m\]\w\[\e[0m\]\$(__sscl_git)${code}\[\e[0m\]\n\[\e[38;5;60m\]╰─\[\e[0m\]${arrow}\[\e[0m\] "
-  PS2="\[\e[38;5;60m\]  ·\[\e[0m\] "
-}
-PROMPT_COMMAND=__sscl_ps1
-"##;
-
-/// Generated .zshrc used through ZDOTDIR so the user's own files are untouched.
-const ZSH_PROMPT: &str = r##"# Generated by SSCL (Secure Shell Command Line). Safe to delete.
-[ -f /etc/zsh/zshrc ] && source /etc/zsh/zshrc
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"
-
-setopt prompt_subst
-autoload -Uz vcs_info 2>/dev/null
-__sscl_git() {
-  local b
-  b=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null) || return
-  local dirty=""
-  [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty="*"
-  print -n " %F{60}─%f %F{215}${b}${dirty}%f"
-}
-PROMPT='%F{60}╭─%f %(?.%F{84}●%f.%F{203}●%f) %F{141}%n%F{60}@%F{86}%m%f %F{60}─%f %F{110}%~%f$(__sscl_git)%(?..  %F{203}[%?]%f)
-%F{60}╰─%f%(?.%B%F{141}❯%f%b.%B%F{203}❯%f%b) '
-PROMPT2='%F{60}  ·%f '
-"##;
-
-/// Generated fish snippet, sourced with `fish -C`.
-const FISH_PROMPT: &str = r##"# Generated by SSCL (Secure Shell Command Line). Safe to delete.
-function fish_prompt
-    set -l ec $status
-    set_color 60; echo -n '╭─ '
-    if test $ec -eq 0
-        set_color 84
-    else
-        set_color 203
-    end
-    echo -n '● '
-    set_color 141; echo -n (whoami)
-    set_color 60;  echo -n '@'
-    set_color 86;  echo -n (prompt_hostname)
-    set_color 60;  echo -n ' ─ '
-    set_color 110; echo -n (prompt_pwd)
-    set -l branch (git symbolic-ref --short HEAD 2>/dev/null; or git rev-parse --short HEAD 2>/dev/null)
-    if test -n "$branch"
-        set_color 60; echo -n ' ─ '
-        set_color 215; echo -n $branch
-    end
-    if test $ec -ne 0
-        set_color 203; echo -n "  [$ec]"
-    end
-    echo
-    set_color 60; echo -n '╰─'
-    if test $ec -eq 0
-        set_color -o 141
-    else
-        set_color -o 203
-    end
-    echo -n '❯ '
-    set_color normal
-end
-"##;

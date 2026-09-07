@@ -166,7 +166,7 @@ pub fn server(painter: &Painter, r: Rect, c: Color32, w: f32) {
     }
 }
 
-/// Terminal chevron `>_` — used for the local shell and the app mark.
+/// Terminal chevron `>_`, used for a pane's own marker.
 pub fn terminal(painter: &Painter, r: Rect, c: Color32, w: f32) {
     line(
         painter,
@@ -175,6 +175,81 @@ pub fn terminal(painter: &Painter, r: Rect, c: Color32, w: f32) {
         w,
     );
     line(painter, vec![p(r, 0.56, 0.74), p(r, 0.82, 0.74)], c, w);
+}
+
+/// The ACLI mark: a rising level meter standing on a baseline — "amplified".
+pub fn amplify(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    line(painter, vec![p(r, 0.18, 0.82), p(r, 0.82, 0.82)], c, w);
+    for (x, top) in [(0.30_f32, 0.56_f32), (0.50, 0.34), (0.70, 0.16)] {
+        line(painter, vec![p(r, x, 0.70), p(r, x, top)], c, w * 1.25);
+    }
+}
+
+/// Split the pane to the right.
+pub fn split_right(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    let body = Rect::from_min_max(p(r, 0.08, 0.16), p(r, 0.92, 0.84));
+    painter.rect_stroke(
+        body,
+        CornerRadius::same(2),
+        Stroke::new(w, c),
+        egui::StrokeKind::Middle,
+    );
+    let x = body.center().x;
+    line(
+        painter,
+        vec![Pos2::new(x, body.min.y), Pos2::new(x, body.max.y)],
+        c,
+        w,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(x, body.min.y), body.max),
+        CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 },
+        c.gamma_multiply(0.5),
+    );
+}
+
+/// Split the pane downwards.
+pub fn split_down(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    let body = Rect::from_min_max(p(r, 0.08, 0.16), p(r, 0.92, 0.84));
+    painter.rect_stroke(
+        body,
+        CornerRadius::same(2),
+        Stroke::new(w, c),
+        egui::StrokeKind::Middle,
+    );
+    let y = body.center().y;
+    line(
+        painter,
+        vec![Pos2::new(body.min.x, y), Pos2::new(body.max.x, y)],
+        c,
+        w,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(body.min.x, y), body.max),
+        CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 },
+        c.gamma_multiply(0.5),
+    );
+}
+
+/// Close the focused pane.
+pub fn close_pane(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    let body = Rect::from_min_max(p(r, 0.08, 0.16), p(r, 0.92, 0.84));
+    painter.rect_stroke(
+        body,
+        CornerRadius::same(2),
+        Stroke::new(w, c),
+        egui::StrokeKind::Middle,
+    );
+    line(painter, vec![p(r, 0.34, 0.36), p(r, 0.66, 0.64)], c, w);
+    line(painter, vec![p(r, 0.66, 0.36), p(r, 0.34, 0.64)], c, w);
+}
+
+/// Sliders — settings.
+pub fn sliders(painter: &Painter, r: Rect, c: Color32, w: f32) {
+    for (y, knob) in [(0.32_f32, 0.62_f32), (0.68, 0.38)] {
+        line(painter, vec![p(r, 0.12, y), p(r, 0.88, y)], c, w);
+        painter.circle_filled(p(r, knob, y), w * 1.6, c);
+    }
 }
 
 /// Circular arrow — refresh.
@@ -277,11 +352,11 @@ pub fn app_mark(painter: &Painter, rect: Rect) {
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x5A)),
         egui::StrokeKind::Inside,
     );
-    terminal(
+    amplify(
         painter,
-        rect.shrink(rect.width() * 0.16),
+        rect.shrink(rect.width() * 0.20),
         Color32::from_rgb(0xEC, 0xEE, 0xF5),
-        (rect.width() * 0.085).max(1.2),
+        (rect.width() * 0.075).max(1.2),
     );
 }
 
@@ -320,11 +395,12 @@ pub fn app_icon_rgba(size: u32) -> Vec<u8> {
         half_width: f32,
     }
 
-    // The `>` chevron and the `_` bar.
+    // A baseline with three rising bars: the "amplified" level meter.
     let strokes = [
-        Stroke { a: (0.30, 0.32), b: (0.48, 0.50), half_width: 0.055 },
-        Stroke { a: (0.48, 0.50), b: (0.30, 0.68), half_width: 0.055 },
-        Stroke { a: (0.56, 0.70), b: (0.74, 0.70), half_width: 0.055 },
+        Stroke { a: (0.24, 0.78), b: (0.76, 0.78), half_width: 0.045 },
+        Stroke { a: (0.34, 0.66), b: (0.34, 0.54), half_width: 0.058 },
+        Stroke { a: (0.50, 0.66), b: (0.50, 0.38), half_width: 0.058 },
+        Stroke { a: (0.66, 0.66), b: (0.66, 0.22), half_width: 0.058 },
     ];
 
     for y in 0..size {

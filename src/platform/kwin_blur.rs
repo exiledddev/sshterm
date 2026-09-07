@@ -5,7 +5,7 @@
 //! list of `x, y, width, height` rectangles, in physical pixels relative to
 //! the window; an empty list means "the whole window".
 //!
-//! SSCL has rounded corners over a transparent background, so it sends a
+//! ACLI has rounded corners over a transparent background, so it sends a
 //! region that follows those corners — otherwise the blur would show through
 //! as a hard square behind them.
 //!

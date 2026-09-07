@@ -1,4 +1,4 @@
-//! Colour palette, glass surfaces and shared drawing helpers for SSCL.
+//! Colour palette, glass surfaces and shared drawing helpers for ACLI.
 //!
 //! The whole application is drawn on a transparent window: every chrome
 //! surface (title bar, ribbon, sidebars, dialogs) is a translucent
@@ -84,7 +84,7 @@ pub fn surface() -> Surface {
     }
 }
 
-/// Explicit opacity, 0-100, from `SSCL_OPACITY`. Zero means "not set".
+/// Explicit opacity, 0-100, from `ACLI_OPACITY`. Zero means "not set".
 static OPACITY: AtomicU8 = AtomicU8::new(0);
 
 /// Overrides the glass density entirely. `percent` is 1-100.
@@ -125,7 +125,7 @@ pub fn island_stroke() -> Stroke {
 // Global style
 // ---------------------------------------------------------------------------
 
-/// Applies the SSCL look to an egui context.
+/// Applies the ACLI look to an egui context.
 pub fn install(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
